@@ -396,6 +396,7 @@ impl Translator {
     pub fn handle_error(&self, error: &Error) -> String {
         match error {
             Error::ConfigInvalid { why } => self.config_is_invalid(why),
+            Error::UnableToUpdateAutostart { why } => self.unable_to_update_autostart(why),
             Error::ManifestInvalid { why, identifier } => self.manifest_is_invalid(why, identifier.as_deref()),
             Error::ManifestCannotBeUpdated { identifier } => self.manifest_cannot_be_updated(identifier.as_deref()),
             Error::CliUnrecognizedGames { games } => self.cli_unrecognized_games(games),
@@ -856,6 +857,10 @@ impl Translator {
 
     pub fn config_is_invalid(&self, why: &str) -> String {
         format!("{}\n{}", translate("config-is-invalid"), why)
+    }
+
+    pub fn unable_to_update_autostart(&self, why: &str) -> String {
+        format!("{}\n{}", translate("unable-to-update-autostart"), why)
     }
 
     pub fn manifest_is_invalid(&self, why: &str, identifier: Option<&str>) -> String {

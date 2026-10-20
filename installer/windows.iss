@@ -46,6 +46,7 @@ Name: "{autodesktop}\Ludusavi"; Filename: "{app}\ludusavi.exe"; Tasks: desktopic
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\ludusavi.exe"; ValueType: string; ValueData: "{app}\ludusavi.exe"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Ludusavi"; Flags: dontcreatekey uninsdeletevalue
 
 [Run]
 Filename: "{app}\ludusavi.exe"; Description: "Open Ludusavi"; Flags: nowait postinstall skipifsilent

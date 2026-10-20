@@ -60,6 +60,7 @@ button-ignore = Ignore
 no-roots-are-configured = Add some roots to back up even more data.
 
 config-is-invalid = Error: The config file is invalid.
+unable-to-update-autostart = Error: Unable to update the startup setting.
 manifest-is-invalid = Error: The manifest file is invalid.
 manifest-cannot-be-updated = Error: Unable to check for an update to the manifest file. Is your Internet connection down?
 cannot-prepare-backup-target = Error: Unable to prepare backup target (either creating or emptying the folder). If you have the folder open in your file browser, try closing it: {$path}

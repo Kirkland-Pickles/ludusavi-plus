@@ -297,10 +297,17 @@ impl ProcessTracker {
                         && previous.host == host
                         && previous.running()
                 });
+                let is_new = previous.is_none();
+                let games = self.paths.get(&path).cloned().unwrap_or_default();
                 tracked.insert(
                     *pid,
                     previous.unwrap_or_else(|| GameProcess::new(*pid, path, host, process.start_time())),
                 );
+                if is_new {
+                    for name in games {
+                        log::info!("Game process detected: {name} (pid {})", pid.as_u32());
+                    }
+                }
             }
             self.tracked = tracked;
         }
@@ -652,6 +659,7 @@ impl BackupRun {
 #[derive(Clone, Debug)]
 pub enum Edit {
     Enable(bool),
+    StartOnBoot(bool),
     Pause(bool),
     Delay(i32),
     Poll(i32),
@@ -667,6 +675,7 @@ pub enum Edit {
 pub struct Settings {
     pub config: Config,
     pub search: String,
+    pub start_on_boot: bool,
 }
 
 impl Settings {
@@ -706,38 +715,43 @@ impl Settings {
             ))
             .push(text(
                 "Closing the window keeps Ludusavi running while this is enabled. Use Quit to exit.",
-            ))
-            .push(
-                Row::new()
-                    .spacing(20)
-                    .align_y(Alignment::Center)
-                    .push(number_input(
-                        self.config.delay_seconds as i32,
-                        "Backup delay (seconds)".into(),
-                        0..=3600,
-                        move |v| edit(Edit::Delay(v)),
-                    ))
-                    .push(number_input(
-                        self.config.poll_seconds as i32,
-                        "Find running games every (seconds)".into(),
-                        1..=60,
-                        move |v| edit(Edit::Poll(v)),
-                    )),
-            )
-            .push(
-                Row::new()
-                    .spacing(20)
-                    .align_y(Alignment::Center)
-                    .push(checkbox("Pause automatic backups", paused, move |v| {
-                        edit(Edit::Pause(v))
-                    }))
-                    .push(
-                        Button::new(text("Quit Ludusavi"))
-                            .padding(5)
-                            .class(style::Button::Negative)
-                            .on_press(Message::Exit { user: true }),
-                    ),
-            );
+            ));
+        if self.config.enabled {
+            content = content.push(checkbox("Launch Ludusavi at startup", self.start_on_boot, move |v| {
+                edit(Edit::StartOnBoot(v))
+            }));
+        }
+        content = content.push(
+            Row::new()
+                .spacing(20)
+                .align_y(Alignment::Center)
+                .push(number_input(
+                    self.config.delay_seconds as i32,
+                    "Backup delay (seconds)".into(),
+                    0..=3600,
+                    move |v| edit(Edit::Delay(v)),
+                ))
+                .push(number_input(
+                    self.config.poll_seconds as i32,
+                    "Find running games every (seconds)".into(),
+                    1..=60,
+                    move |v| edit(Edit::Poll(v)),
+                )),
+        );
+        content = content.push(
+            Row::new()
+                .spacing(20)
+                .align_y(Alignment::Center)
+                .push(checkbox("Pause automatic backups", paused, move |v| {
+                    edit(Edit::Pause(v))
+                }))
+                .push(
+                    Button::new(text("Quit Ludusavi"))
+                        .padding(5)
+                        .class(style::Button::Negative)
+                        .on_press(Message::Exit { user: true }),
+                ),
+        );
         for (i, game) in self.config.games.iter().enumerate() {
             let mut paths = Column::new().spacing(5);
             for (j, path) in game.executables.iter().enumerate() {

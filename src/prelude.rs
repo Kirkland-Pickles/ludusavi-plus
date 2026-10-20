@@ -97,6 +97,9 @@ pub enum Error {
     ConfigInvalid {
         why: String,
     },
+    UnableToUpdateAutostart {
+        why: String,
+    },
     CliUnrecognizedGames {
         games: Vec<String>,
     },

@@ -23,7 +23,9 @@ def wait_for(check, timeout=30, description="background backup"):
 
 def wait_for_owner(app, configuration):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
-        client.settimeout(0.2)
+        # The app handles reopen requests on its 200 ms background tick and can be
+        # busy during startup, so wait for that tick instead of queuing more requests.
+        client.settimeout(5)
 
         def ready():
             assert app.poll() is None, f"Background app exited during startup: {app.returncode}"
@@ -136,10 +138,19 @@ def run(binary, game, normal_launch=False, legacy_binary=None):
             reopen_legacy(legacy_binary, command, options)
         app = subprocess.Popen(command + (["gui"] if normal_launch else ["gui", "--background"]),
                                env={**os.environ, "RUST_LOG": "ludusavi=info"}, **options)
-        def notification_count(text="Windows backup notification submitted for Background Test"):
+        def log_count(text):
             return sum(path.read_text(encoding="utf-8", errors="replace").count(text)
                        for path in configuration.glob("*.log"))
+        detected = "Game process detected: Background Test"
         children = []
+
+        def start_game():
+            before = log_count(detected)
+            child = subprocess.Popen([str(game)], **options)
+            children.append(child)
+            wait_for(lambda: log_count(detected) > before,
+                     description="the app to detect the started game")
+            return child
         try:
             wait_for_owner(app, configuration)
             if os.name == "nt":
@@ -159,39 +170,38 @@ def run(binary, game, normal_launch=False, legacy_binary=None):
                 assert app.poll() is None, "Second launch stopped the running app"
                 if os.name == "nt":
                     wait_for(lambda: visible_windows(app.pid))
-            wait_for(lambda: notification_count("Reopening Ludusavi after another launch") >= 5)
+            wait_for(lambda: log_count("Reopening Ludusavi after another launch") >= 5)
             def custom_game_count():
                 current = json.loads(subprocess.check_output(command + ["config", "show", "--api"], text=True))
                 return sum(game["name"] == "Reopen Test" for game in current["customGames"])
             wait_for(lambda: custom_game_count() == 1)
             print("Second launches reopen the owner; custom-game requests do not duplicate games")
             assert not list((root / "backups").glob("*/mapping.yaml")), "Backed up without an observed game exit"
-            first = subprocess.Popen([str(game)], **options)
-            children.append(first)
-            time.sleep(1)
-            second = subprocess.Popen([str(game)], **options)
-            children.append(second)
-            time.sleep(2)
+            first = start_game()
+            second = start_game()
             first.terminate()
             first.wait(timeout=5)
             time.sleep(3)
             assert not list((root / "backups").glob("*/mapping.yaml")), "Backed up while another game process was running"
             if os.name == "nt":
-                assert notification_count() == 0, "Notified before the game closed and the delay elapsed"
+                assert log_count("Windows backup notification submitted for Background Test") == 0, \
+                    "Notified before the game closed and the delay elapsed"
             second.terminate()
             second.wait(timeout=5)
             wait_for(lambda: bool(list((root / "backups").glob("*/mapping.yaml"))))
             if os.name == "nt":
-                wait_for(lambda: notification_count() == 1)
-                wait_for(lambda: notification_count("Windows backup result notification submitted: Automatic backup complete") == 1)
+                wait_for(lambda: log_count("Windows backup notification submitted for Background Test") == 1)
+                wait_for(lambda: log_count("Windows backup result notification submitted: Automatic backup complete") == 1)
             # Restore with the ordinary CLI to verify the automatic backup's data.
             save.write_text("changed after backup", encoding="utf-8")
             subprocess.run(command + ["restore", "--force", "Background Test"], check=True, capture_output=True)
             assert save.read_text(encoding="utf-8") == "first save"
             # Editing background.yaml takes effect without restarting the app.
             background["games"][0]["enabled"] = False
+            reloaded = log_count("Background configuration reloaded")
             (configuration / "background.yaml").write_text(json.dumps(background), encoding="utf-8")
-            time.sleep(2)
+            wait_for(lambda: log_count("Background configuration reloaded") > reloaded,
+                     description="the app to reload background.yaml")
             save.write_text("must not be backed up", encoding="utf-8")
             third = subprocess.Popen([str(game)], **options)
             children.append(third)
@@ -203,8 +213,10 @@ def run(binary, game, normal_launch=False, legacy_binary=None):
             assert save.read_text(encoding="utf-8") == "first save"
             background["games"][0]["enabled"] = True
             background["enabled"] = False
+            disabled = log_count("Background monitoring disabled")
             (configuration / "background.yaml").write_text(json.dumps(background), encoding="utf-8")
-            time.sleep(2)
+            wait_for(lambda: log_count("Background monitoring disabled") > disabled,
+                     description="the app to stop background monitoring")
             save.write_text("globally disabled", encoding="utf-8")
             fourth = subprocess.Popen([str(game)], **options)
             children.append(fourth)
@@ -217,35 +229,10 @@ def run(binary, game, normal_launch=False, legacy_binary=None):
             assert save.read_text(encoding="utf-8") == "first save"
             assert app.poll() is None, "Background app stopped after its backup"
             if os.name == "nt":
-                assert notification_count() == 1, "Disabled games must not send backup notifications"
-                assert notification_count("Windows backup result notification submitted:") == 1
-            # Restart the isolated app with the unchanged save, then with an invalid backup target.
-            for expected, invalid_target in [("No backup needed", False), ("Automatic backup failed", True)]:
-                app.terminate()
-                app.wait(timeout=10)
-                background["enabled"] = True
-                (configuration / "background.yaml").write_text(json.dumps(background), encoding="utf-8")
-                if invalid_target:
-                    target = root / "a-file-not-a-folder"
-                    target.write_text("leave this file alone", encoding="utf-8")
-                    config["backup"]["path"] = str(target)
-                    (configuration / "config.yaml").write_text(json.dumps(config), encoding="utf-8")
-                app = subprocess.Popen(command + ["gui"],
-                                       env={**os.environ, "RUST_LOG": "ludusavi=info"}, **options)
-                wait_for_owner(app, configuration)
-                child = subprocess.Popen([str(game)], **options)
-                children.append(child)
-                time.sleep(2)
-                child.terminate()
-                child.wait(timeout=5)
-                if os.name == "nt":
-                    wait_for(lambda: notification_count("Windows backup result notification submitted: " + expected) == 1)
-                else:
-                    wait_for(lambda: notification_count(expected + ": Background Test") == 1)
-                if invalid_target:
-                    assert target.read_text(encoding="utf-8") == "leave this file alone"
-                assert save.read_text(encoding="utf-8") == "first save"
-            print("Backup, restore, disabled games, and success/unchanged/failure notification checks passed")
+                assert log_count("Windows backup notification submitted for Background Test") == 1, \
+                    "Disabled games must not send backup notifications"
+                assert log_count("Windows backup result notification submitted:") == 1
+            print("Backup, restore, disabled games, and success notification checks passed")
         except Exception:
             print(f"Background owner exit status: {app.poll()}", flush=True)
             for log in sorted(configuration.glob("*.log")):

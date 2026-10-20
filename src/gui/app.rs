@@ -8,7 +8,7 @@ use iced::{Alignment, Length, Subscription, Task, keyboard, widget::scrollable};
 use crate::{
     cloud::{MetadataEdit, Rclone, Remote, rclone_monitor},
     gui::{
-        background, button,
+        autostart, background, button,
         common::{
             BackupPhase, BrowseFileSubject, BrowseSubject, Flags, GameAction, GameSelection, Message, Operation,
             RestorePhase, Screen, ScrollSubject, UndoSubject, ValidatePhase,
@@ -354,6 +354,13 @@ impl App {
                 return Task::none();
             }
             Edit::Enable(enabled) => config.enabled = enabled,
+            Edit::StartOnBoot(on) => {
+                if let Err(why) = autostart::set_enabled(on) {
+                    return self.show_error(Error::UnableToUpdateAutostart { why });
+                }
+                self.background_settings.start_on_boot = on;
+                return Task::none();
+            }
             Edit::Delay(seconds) => config.delay_seconds = seconds.clamp(0, 3600) as u64,
             Edit::Poll(seconds) => config.poll_seconds = seconds.clamp(1, 60) as u64,
             Edit::GameEnabled(i, enabled) => {
@@ -387,6 +394,13 @@ impl App {
                 if let Err(why) = config.add_executable(name, executable) {
                     return self.show_error(Error::ConfigInvalid { why });
                 }
+            }
+        }
+        if !config.enabled && self.background_settings.start_on_boot {
+            // The boot launch would re-enable the tray watcher, so drop the entry.
+            match autostart::set_enabled(false) {
+                Ok(()) => self.background_settings.start_on_boot = false,
+                Err(why) => log::warn!("Failed to remove the startup entry: {why}"),
             }
         }
         // Create the tray before persisting an enabled state, so a tray failure stays disabled.
@@ -423,6 +437,9 @@ impl App {
     fn open_background_settings(&mut self) -> Task<Message> {
         if let Some(id) = self.background_settings_window {
             return iced::window::gain_focus(id);
+        }
+        if let Ok(enabled) = autostart::is_enabled() {
+            self.background_settings.start_on_boot = enabled;
         }
         let (id, open) = iced::window::open(super::window_settings());
         self.background_settings_window = Some(id);
@@ -2090,11 +2107,13 @@ impl App {
                 self.background_settings.config = config.clone();
                 if !config.enabled {
                     self.background = None;
+                    log::info!("Background monitoring disabled");
                     return if self.hidden { self.show_window() } else { Task::none() };
                 }
                 if background.config != config {
                     background.monitor.reconfigure(&background.config, &config);
                     background.config = config;
+                    log::info!("Background configuration reloaded");
                 }
                 background
                     .monitor

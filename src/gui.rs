@@ -1,4 +1,5 @@
 mod app;
+mod autostart;
 mod background;
 mod badge;
 mod button;
