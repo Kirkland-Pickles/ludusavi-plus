@@ -110,6 +110,8 @@ pub enum ValidatePhase {
 pub enum Message {
     Ignore,
     WindowOpened(iced::window::Id),
+    #[cfg(windows)]
+    SystemTheme(iced::theme::Mode),
     CloseWindow(iced::window::Id),
     BackgroundTick,
     BackgroundPolled(

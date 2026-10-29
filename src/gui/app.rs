@@ -127,6 +127,8 @@ pub struct App {
     background_last_poll: Option<Instant>,
     window: Option<iced::window::Id>,
     background_settings_window: Option<iced::window::Id>,
+    #[cfg(windows)]
+    system_theme: iced::theme::Mode,
     hidden: bool,
     modifiers: keyboard::Modifiers,
     jump_to_game_after_scan: Option<String>,
@@ -1852,6 +1854,9 @@ impl App {
             },
         ];
 
+        #[cfg(windows)]
+        commands.push(iced::system::theme().map(Message::SystemTheme));
+
         let mut screen = Screen::default();
         let mut modals: Vec<Modal> = vec![];
         let mut pending_save = HashMap::new();
@@ -1993,12 +1998,32 @@ impl App {
         (self.config.theme != config::Theme::Auto).then(|| crate::gui::style::Theme::from(self.config.theme))
     }
 
+    fn refresh_title_bars(&self) -> Task<Message> {
+        #[cfg(windows)]
+        {
+            use iced::theme::Base;
+            let theme = match self.config.theme {
+                config::Theme::Auto => <style::Theme as Base>::default(self.system_theme),
+                theme => style::Theme::from(theme),
+            };
+            Task::batch(
+                [self.window, self.background_settings_window]
+                    .into_iter()
+                    .flatten()
+                    .map(|window| super::set_title_bar(window, &theme).map(|_| Message::Ignore)),
+            )
+        }
+        #[cfg(not(windows))]
+        Task::none()
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Ignore => Task::none(),
             Message::WindowOpened(id) => {
+                let apply_title_bar = self.refresh_title_bars();
                 if self.background_settings_window == Some(id) {
-                    return Task::none();
+                    return apply_title_bar;
                 }
                 self.window = Some(id);
                 if let Some(config) = self.background_config.take() {
@@ -2008,13 +2033,24 @@ impl App {
                             // Leave startup questions and errors visible.
                             if self.flags.background && self.modals.is_empty() {
                                 self.hidden = true;
-                                return self.hide_window(id);
+                                return Task::batch([apply_title_bar, self.hide_window(id)]);
                             }
                         }
-                        Err(why) => return self.show_error(Error::ConfigInvalid { why }),
+                        Err(why) => {
+                            return Task::batch([apply_title_bar, self.show_error(Error::ConfigInvalid { why })]);
+                        }
                     }
                 }
-                Task::none()
+                apply_title_bar
+            }
+            #[cfg(windows)]
+            Message::SystemTheme(mode) => {
+                self.system_theme = mode;
+                if self.config.theme == config::Theme::Auto {
+                    self.refresh_title_bars()
+                } else {
+                    Task::none()
+                }
             }
             Message::CloseWindow(id) => {
                 if self.background_settings_window == Some(id) {
@@ -2248,6 +2284,7 @@ impl App {
                 match event {
                     config::Event::Theme(theme) => {
                         self.config.theme = theme;
+                        task = Some(self.refresh_title_bars());
                     }
                     config::Event::Language(language) => {
                         TRANSLATOR.set_language(language);
@@ -3721,6 +3758,9 @@ impl App {
             }),
             rclone_monitor::run().map(Message::RcloneMonitor),
         ];
+
+        #[cfg(windows)]
+        subscriptions.push(iced::system::theme_changes().map(Message::SystemTheme));
 
         if self.background.is_some() {
             subscriptions.push(iced::time::every(Duration::from_millis(200)).map(|_| Message::BackgroundTick));

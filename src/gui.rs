@@ -113,3 +113,40 @@ fn window_settings() -> iced::window::Settings {
         ..Default::default()
     }
 }
+
+#[cfg(windows)]
+fn set_title_bar(window: iced::window::Id, theme: &style::Theme) -> iced::Task<()> {
+    use iced::theme::Base;
+    use iced::window::raw_window_handle::RawWindowHandle;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DwmSetWindowAttribute};
+
+    let base = Base::base(theme);
+    let colorref = |color: iced::Color| {
+        let [r, g, b, _] = color.into_rgba8();
+        u32::from_le_bytes([r, g, b, 0])
+    };
+    let background = colorref(base.background_color);
+    let text = colorref(base.text_color);
+
+    iced::window::run(window, move |window| {
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return;
+        };
+        let hwnd = HWND(handle.hwnd.get() as *mut _);
+
+        unsafe {
+            for (attribute, color) in [(DWMWA_CAPTION_COLOR, background), (DWMWA_TEXT_COLOR, text)] {
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    attribute,
+                    &color as *const _ as _,
+                    std::mem::size_of_val(&color) as u32,
+                );
+            }
+        }
+    })
+}
