@@ -151,6 +151,17 @@ fn main() {
     }
     let debug = args.as_ref().map(|x| x.debug).unwrap_or_default();
 
+    #[cfg(target_os = "windows")]
+    if args
+        .as_ref()
+        .is_ok_and(|args| matches!(args.sub, None | Some(cli::parse::Subcommand::Gui { .. })))
+        && std::env::var_os("RTSSHooksProfileOverride").is_none()
+    {
+        unsafe {
+            std::env::set_var("RTSSHooksProfileOverride", "EnableOSD,0");
+        }
+    }
+
     prepare_winit();
     let logger = prepare_logging(debug);
     #[allow(clippy::useless_asref)]
