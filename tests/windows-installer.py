@@ -26,6 +26,7 @@ def run(binary, compiler, user_data=False):
         script = (repo / "installer/windows.iss").read_text(encoding="utf-8")
         script = script.replace("78A48778-C44A-45EB-AED3-62D625E21970", identity)
         script = script.replace(r"App Paths\ludusavi.exe", rf"App Paths\ludusavi-test-{identity}.exe")
+        script = script.replace('ValueName: "Ludusavi"', f'ValueName: "Ludusavi Test {identity}"')
         script = script.replace(r"..\LICENSE", str(repo / "LICENSE"))
         script = script.replace(r"..\assets\icon.ico", str(repo / "assets/icon.ico"))
         test_script = root / "test.iss"
