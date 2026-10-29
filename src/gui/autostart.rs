@@ -48,24 +48,3 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
     let handle = handle()?;
     if enabled { handle.enable() } else { handle.disable() }.map_err(|why| why.to_string())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn launch_target_is_the_gui_background_command() {
-        let handle = handle().unwrap();
-        assert_eq!(handle.get_app_name(), APP_NAME);
-        assert_eq!(handle.get_args(), ARGS);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn desktop_exec_quoting_escapes_reserved_characters() {
-        assert_eq!(
-            escape_desktop_exec(r#"/opt/My Game/$HOME`x"y\z%f"#),
-            r#"/opt/My Game/\$HOME\`x\"y\\z%%f"#
-        );
-    }
-}

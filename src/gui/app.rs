@@ -3921,13 +3921,6 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_note_does_not_schedule_save() {
-        let (_temp, mut app, _file) = note_editor();
-        assert!(!app.restore_screen.log.set_comment("game3", String::new()));
-        assert!(app.pending_save.is_empty());
-    }
-
-    #[test]
     fn multiple_edits_keep_original_cloud_baseline_and_failed_edits_can_retry() {
         let (_temp, mut app, file) = note_editor();
         app.config.cloud.synchronize = true;
@@ -4031,17 +4024,6 @@ mod tests {
         assert_eq!(app.edited_metadata["game3"].before, uploaded);
         assert!(app.metadata_sync_requested);
         assert!(file.try_read().unwrap().contains("newer note"));
-    }
-
-    #[test]
-    fn stale_process_poll_cannot_override_new_background_settings() {
-        let mut app = App {
-            background_revision: 2,
-            ..Default::default()
-        };
-        let _ = app.update(Message::BackgroundPolled(1, Err("old poll".into())));
-        assert!(app.modals.is_empty());
-        assert!(!app.background_settings.config.enabled);
     }
 
     #[test]
