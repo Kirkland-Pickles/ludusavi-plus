@@ -8,7 +8,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{prelude::StrictPath, scan::layout::BackupLayout};
+use crate::{
+    prelude::StrictPath,
+    resource::config::ToggledPaths,
+    scan::{ScanKind, layout::BackupLayout},
+};
 
 const FOLDER_NAME: &str = "ludusavi-backup";
 
@@ -57,7 +61,42 @@ fn candidate(path: &Path) -> Option<StrictPath> {
         return None;
     }
     let path = StrictPath::from(path.to_path_buf());
-    (!BackupLayout::new(path.clone()).restorable_games().is_empty()).then_some(path)
+    has_backups(&path).then_some(path)
+}
+
+pub fn has_backups(path: &StrictPath) -> bool {
+    let layout = BackupLayout::new(path.clone());
+    layout
+        .restorable_games()
+        .into_iter()
+        .any(|game| game_has_payload(layout.game_layout(&game)))
+}
+
+fn game_has_payload(mut layout: crate::scan::layout::GameLayout) -> bool {
+    // Older mappings have no `backups` entries until this read-only migration
+    // reconstructs the legacy `.` backup in memory.
+    layout.migrate_legacy_backup(false);
+
+    layout.restorable_backups_flattened().into_iter().any(|backup| {
+        if !backup.needed() {
+            return false;
+        }
+        if backup.name().ends_with(".zip") {
+            return layout
+                .path
+                .joined(backup.name())
+                .as_std_path_buf()
+                .ok()
+                .and_then(|path| std::fs::File::open(path).ok())
+                .and_then(|file| zip::ZipArchive::new(file).ok())
+                .is_some_and(|archive| !archive.is_empty());
+        }
+
+        let id = backup.id();
+        let files = layout.restorable_files(&id, ScanKind::Backup, &[], false, &ToggledPaths::default(), None);
+        files.keys().any(StrictPath::is_file)
+            || (backup.includes_registry() && layout.registry_content(&id).is_some_and(|content| !content.is_empty()))
+    })
 }
 
 fn walk(roots: &[PathBuf], cancel: &AtomicBool, budget: Duration, mut found: impl FnMut(StrictPath)) -> bool {
@@ -110,7 +149,8 @@ pub fn find(cancel: Arc<AtomicBool>, preferred: Vec<PathBuf>, send: impl Fn(Even
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
-            if let Some(path) = candidate(&path) {
+            let path = StrictPath::from(path);
+            if has_backups(&path) {
                 send(Event::Found(path));
                 send(Event::Finished { limited: false });
                 return;
@@ -539,11 +579,20 @@ mod everything {
 mod tests {
     use super::*;
 
-    fn backup(root: &Path) {
+    fn mapping(root: &Path) {
         std::fs::create_dir_all(root.join("game")).unwrap();
         std::fs::write(
             root.join("game/mapping.yaml"),
             include_str!("../../tests/backup/game3-renamed/mapping.yaml"),
+        )
+        .unwrap();
+    }
+
+    fn backup(root: &Path) {
+        mapping(root);
+        std::fs::write(
+            root.join("game/registry.yaml"),
+            include_str!("../../tests/backup/game3-renamed/registry.yaml"),
         )
         .unwrap();
     }
@@ -573,6 +622,72 @@ mod tests {
             .into_iter()
             .collect()
         );
+    }
+
+    #[test]
+    fn rejects_mapping_only_candidates_and_missing_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let empty = root.path().join(FOLDER_NAME);
+        std::fs::create_dir_all(empty.join("empty-game")).unwrap();
+        std::fs::write(
+            empty.join("empty-game/mapping.yaml"),
+            "---\nname: empty-game\ndrives: {}\nbackups: []\n",
+        )
+        .unwrap();
+        assert!(candidate(&empty).is_none());
+
+        let missing = root.path().join("missing").join(FOLDER_NAME);
+        mapping(&missing);
+        assert!(candidate(&missing).is_none());
+    }
+
+    #[test]
+    fn accepts_configured_backup_folders_with_other_names() {
+        let root = tempfile::tempdir().unwrap();
+        let configured = root.path().join("my-backups");
+        backup(&configured);
+        assert!(has_backups(&StrictPath::from(configured.clone())));
+        let events = std::sync::Mutex::new(Vec::new());
+        find(Arc::new(AtomicBool::new(false)), vec![configured.clone()], |event| {
+            events.lock().unwrap().push(event);
+        });
+        assert!(
+            matches!(events.lock().unwrap().first(), Some(Event::Found(path)) if *path == StrictPath::from(configured))
+        );
+    }
+
+    #[test]
+    fn accepts_legacy_payload_without_writing_migrated_mapping() {
+        let root = tempfile::tempdir().unwrap();
+        let backup_root = root.path().join(FOLDER_NAME);
+        let game = backup_root.join("legacy-game");
+        std::fs::create_dir_all(game.join("drive-0")).unwrap();
+        let mapping = "---\nname: legacy-game\ndrives:\n  drive-0: \"\"\nbackups: []\n";
+        std::fs::write(game.join("mapping.yaml"), mapping).unwrap();
+        std::fs::write(game.join("drive-0/save.dat"), b"harmless test payload").unwrap();
+
+        assert!(candidate(&backup_root).is_some());
+        assert_eq!(mapping, std::fs::read_to_string(game.join("mapping.yaml")).unwrap());
+    }
+
+    #[test]
+    fn rejects_corrupt_archives_and_accepts_readable_payloads() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let backup_root = root.path().join(FOLDER_NAME);
+        let game = backup_root.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(game.join("mapping.yaml"),
+            "name: game\ndrives: {}\nbackups:\n  - name: backup.zip\n    when: 2000-01-02T03:04:05Z\n    files:\n      /save.dat: {hash: test, size: 1}\n    registry: {hash: null}\n    children: []\n").unwrap();
+        std::fs::write(game.join("backup.zip"), "not a zip").unwrap();
+        assert!(candidate(&backup_root).is_none());
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(game.join("backup.zip")).unwrap());
+        archive
+            .start_file("save.dat", zip::write::FileOptions::default())
+            .unwrap();
+        archive.write_all(b"x").unwrap();
+        archive.finish().unwrap();
+        assert!(candidate(&backup_root).is_some());
     }
 
     #[test]

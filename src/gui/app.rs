@@ -454,7 +454,9 @@ impl App {
     }
 
     fn find_restore_folders(&mut self) -> Task<Message> {
-        if self.config.restore.path.exists() {
+        if self.config.restore.path.exists()
+            && (!self.config.restore.path.is_dir() || super::restore_search::has_backups(&self.config.restore.path))
+        {
             return Task::none();
         }
         let search = &mut self.restore_screen.folder_search;
@@ -1247,6 +1249,9 @@ impl App {
                         variant: Error::RestorationSourceInvalid { path },
                     });
                 }
+                if !super::restore_search::has_backups(&path) {
+                    return self.find_restore_folders();
+                }
 
                 let mut cleared_log = false;
                 if games.is_none() {
@@ -1814,6 +1819,7 @@ impl App {
 
     fn switch_screen(&mut self, screen: Screen) -> Task<Message> {
         let leaving_restore = self.screen == Screen::Restore && screen != Screen::Restore;
+        let entering_restore = self.screen != Screen::Restore && screen == Screen::Restore;
         if leaving_restore && self.restore_screen.folder_search.searching {
             self.restore_screen.folder_search.stop();
             self.timed_notification = None;
@@ -1823,7 +1829,14 @@ impl App {
             self.save_pending(true);
             Task::batch([self.refresh_scroll_position(), self.sync_edited_metadata()])
         } else {
-            self.refresh_scroll_position()
+            Task::batch([
+                self.refresh_scroll_position(),
+                if entering_restore && self.operation.idle() {
+                    self.find_restore_folders()
+                } else {
+                    Task::none()
+                },
+            ])
         }
     }
 
@@ -2126,7 +2139,7 @@ impl App {
                 if !matches!(self.modals.last(), Some(Modal::FoundRestoreFolder { path: found }) if found == &path) {
                     return Task::none();
                 }
-                if !path.is_dir() || BackupLayout::new(path.clone()).restorable_games().is_empty() {
+                if !path.is_dir() || !super::restore_search::has_backups(&path) {
                     return self.show_error(Error::RestorationSourceInvalid { path });
                 }
                 let close = self.close_specific_modal(modal::Kind::FoundRestoreFolder);
@@ -2148,7 +2161,10 @@ impl App {
                 {
                     return Task::none();
                 }
-                if self.config.restore.path.exists() {
+                if self.config.restore.path.exists()
+                    && (!self.config.restore.path.is_dir()
+                        || super::restore_search::has_backups(&self.config.restore.path))
+                {
                     self.restore_screen.folder_search.stop();
                     self.timed_notification = None;
                     return Task::none();
@@ -4027,6 +4043,9 @@ mod tests {
         file.create_parent_dir().unwrap();
         file.write_with_content(include_str!("../../tests/backup/game3-renamed/mapping.yaml"))
             .unwrap();
+        root.joined("game3/registry.yaml")
+            .write_with_content(include_str!("../../tests/backup/game3-renamed/registry.yaml"))
+            .unwrap();
         let layout = GameLayout::load(root.joined("game3")).unwrap();
         let backup = layout.restorable_backups_flattened().pop().unwrap();
         let mut app = App {
@@ -4093,7 +4112,8 @@ mod tests {
         let _ = app.update(Message::DiscardBackupMetadata("game3".into()));
         assert!(app.pending_save.is_empty());
         assert!(app.edited_metadata.is_empty());
-        assert!(matches!(app.operation, Operation::Restore { .. }));
+        assert!(app.operation.idle());
+        assert!(app.restore_screen.folder_search.searching);
         assert_eq!(file.try_read().unwrap(), replaced);
     }
 
@@ -4388,6 +4408,10 @@ mod tests {
         mapping
             .write_with_content(include_str!("../../tests/backup/game3-renamed/mapping.yaml"))
             .unwrap();
+        found
+            .joined("game/registry.yaml")
+            .write_with_content(include_str!("../../tests/backup/game3-renamed/registry.yaml"))
+            .unwrap();
         let mut app = App::default();
         let missing = StrictPath::from(temp.path().join("missing"));
         let _ = app.update(config::Event::RestoreSource(missing.render()).into());
@@ -4438,6 +4462,17 @@ mod tests {
         ));
         assert_eq!(app.config.restore.path.render(), changed.render());
         assert!(app.timed_notification.is_none());
+    }
+
+    #[test]
+    fn entering_restore_searches_an_existing_empty_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = App::default();
+        app.config.restore.path = StrictPath::from(temp.path());
+        let _ = app.switch_screen(Screen::Restore);
+        assert!(app.restore_screen.folder_search.searching);
+        assert!(app.operation.idle());
+        assert_eq!(app.config.restore.path, StrictPath::from(temp.path()));
     }
     #[test]
     fn declining_found_restore_folder_keeps_current_path() {
