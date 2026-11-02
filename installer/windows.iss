@@ -1,6 +1,9 @@
 #ifndef Binary
   #error Binary is required
 #endif
+#ifndef RcloneDir
+  #error RcloneDir is required
+#endif
 #ifndef Version
   #error Version is required
 #endif
@@ -29,6 +32,7 @@ SolidCompression=yes
 WizardStyle=modern
 CloseApplications=yes
 RestartApplications=no
+MinVersion=10.0
 #if Architecture == "x64"
 ArchitecturesAllowed=x64compatible
 #endif
@@ -39,6 +43,11 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 [Files]
 Source: "{#Binary}"; DestDir: "{app}"; DestName: "ludusavi.exe"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RcloneDir}\rclone.exe"; DestDir: "{app}\Rclone"; Flags: ignoreversion
+Source: "{#RcloneDir}\COPYING"; DestDir: "{app}\Rclone"; Flags: ignoreversion
+Source: "{#RcloneDir}\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}\Rclone"; Flags: ignoreversion
+Source: "{#RcloneDir}\THIRD-PARTY-LICENSES.csv"; DestDir: "{app}\Rclone"; Flags: ignoreversion
+Source: "{#RcloneDir}\licenses\*"; DestDir: "{app}\Rclone\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\Ludusavi"; Filename: "{app}\ludusavi.exe"

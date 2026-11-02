@@ -17,11 +17,13 @@ jobs:
             rust-target: x86_64-pc-windows-msvc
             artifact-name: win64
             artifact-file: ludusavi.exe
+            rclone-architecture: x64
             tar: false
           - os: windows-latest
             rust-target: i686-pc-windows-msvc
             artifact-name: win32
             artifact-file: ludusavi.exe
+            rclone-architecture: x86
             tar: false
           - os: ubuntu-22.04
             rust-target: x86_64-unknown-linux-gnu
@@ -55,6 +57,20 @@ jobs:
       - if: ${{ startsWith(matrix.os, 'ubuntu-') }}
         run: sudo apt-get update && sudo apt-get install -y gcc libxcb-composite0-dev libgtk-3-dev
       - run: cargo build --release --target ${{ matrix.rust-target }}
+      - if: ${{ matrix.os == 'windows-latest' }}
+        uses: actions/checkout@v4
+        with:
+          repository: rclone/rclone
+          ref: v1.75.2
+          path: rclone-source
+          persist-credentials: false
+      - if: ${{ matrix.os == 'windows-latest' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - if: ${{ matrix.os == 'windows-latest' }}
+        run: python scripts/collect-rclone-licenses.py --source rclone-source --architecture ${{ matrix.rclone-architecture }} --output "$env:RUNNER_TEMP\rclone-licenses"
       - if: ${{ matrix.artifact-name == 'mac' }}
         run: bash tests/package-macos-app.sh
       - if: ${{ matrix.artifact-name == 'mac' }}
@@ -74,13 +90,13 @@ jobs:
           name: ludusavi-v${{ env.LUDUSAVI_VERSION }}-${{ matrix.artifact-name }}
           path: target/${{ matrix.rust-target }}/release/ludusavi-v${{ env.LUDUSAVI_VERSION }}-${{ matrix.artifact-name }}.tar.gz
           if-no-files-found: error
-      - if: ${{ !matrix.tar }}
-        run: cp "target/${{ matrix.rust-target }}/release/${{ matrix.artifact-file }}" "target/${{ matrix.rust-target }}/release/ludusavi-${{ matrix.artifact-name }}.exe"
-      - if: ${{ !matrix.tar }}
+      - if: ${{ startsWith(matrix.artifact-name, 'win') }}
+        run: python scripts/rclone_bundle.py portable target/${{ matrix.rust-target }}/release/${{ matrix.artifact-file }} --architecture ${{ matrix.rclone-architecture }} --version ${{ env.LUDUSAVI_VERSION }} --rclone-licenses "$env:RUNNER_TEMP\rclone-licenses" --output target/${{ matrix.rust-target }}/release
+      - if: ${{ startsWith(matrix.artifact-name, 'win') }}
         uses: actions/upload-artifact@v4
         with:
-          name: ludusavi-v${{ env.LUDUSAVI_VERSION }}-${{ matrix.artifact-name }}
-          path: target/${{ matrix.rust-target }}/release/ludusavi-${{ matrix.artifact-name }}.exe
+          name: ludusavi-v${{ env.LUDUSAVI_VERSION }}-${{ matrix.artifact-name }}-portable
+          path: target/${{ matrix.rust-target }}/release/ludusavi-v${{ env.LUDUSAVI_VERSION }}-${{ matrix.artifact-name }}.zip
           if-no-files-found: error
 
   test:
@@ -101,6 +117,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}
+      - if: ${{ matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          $rclone = Join-Path $env:RUNNER_TEMP 'rclone.exe'
+          python scripts/rclone_bundle.py download x64 $rclone
+          "LUDUSAVI_TEST_RCLONE=$rclone" >> $env:GITHUB_ENV
       - name: Prepare native test tools
         shell: bash
         run: |
@@ -109,20 +131,22 @@ jobs:
           system = {"Windows": "windows", "Linux": "linux", "macOS": "osx"}[os.environ["RUNNER_OS"]]
           arch = "arm64" if os.environ["RUNNER_ARCH"] == "ARM64" else "amd64"
           checksums = {
-              "windows-amd64": "4fe815f944b2c47c8a051020e8913728acc9bcf64df8bb85634399d9a1234cdd",
               "linux-amd64": "ab9fa5877cee91c64fdfd61a27028a458cf618b39259e5c371dc2ec34a12e415",
               "osx-amd64": "37e50641cd736de296b8aca8149e607b9923b357d79abb902e89c4cdb1fcc790",
               "osx-arm64": "d1cea838b618f9b4f15984748502232684e92ff0b90e3c4c8bd91ac21f4d8695",
           }
-          name = f"rclone-v1.71.2-{system}-{arch}"
-          data = urllib.request.urlopen(f"https://github.com/rclone/rclone/releases/download/v1.71.2/{name}.zip", timeout=60).read()
-          assert hashlib.sha256(data).hexdigest() == checksums[f"{system}-{arch}"], "Rclone checksum mismatch"
           root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "ludusavi-test-tools"
           root.mkdir()
-          zipfile.ZipFile(io.BytesIO(data)).extractall(root)
           suffix = ".exe" if system == "windows" else ""
-          rclone = root / name / f"rclone{suffix}"
-          rclone.chmod(0o755)
+          if system == "windows":
+              rclone = pathlib.Path(os.environ["LUDUSAVI_TEST_RCLONE"])
+          else:
+              name = f"rclone-v1.71.2-{system}-{arch}"
+              data = urllib.request.urlopen(f"https://github.com/rclone/rclone/releases/download/v1.71.2/{name}.zip", timeout=60).read()
+              assert hashlib.sha256(data).hexdigest() == checksums[f"{system}-{arch}"], "Rclone checksum mismatch"
+              zipfile.ZipFile(io.BytesIO(data)).extractall(root)
+              rclone = root / name / f"rclone{suffix}"
+              rclone.chmod(0o755)
           helper = root / f"game{suffix}"
           subprocess.run(["rustc", "tests/process-helper.rs", "-o", str(helper)], check=True)
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
@@ -217,6 +241,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: installer-${{ matrix.target }}
+      - if: matrix.platform == 'windows'
+        uses: actions/checkout@v4
+        with:
+          repository: rclone/rclone
+          ref: v1.75.2
+          path: rclone-source
+          persist-credentials: false
+      - if: matrix.platform == 'windows'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+          cache: false
       - if: matrix.platform == 'linux'
         run: sudo apt-get update && sudo apt-get install -y gcc libxcb-composite0-dev libgtk-3-dev
       - if: matrix.platform == 'windows'
@@ -232,9 +268,14 @@ jobs:
           if ($process.ExitCode -ne 0) { throw 'Inno Setup installation failed' }
           "ISCC=$innoDir\ISCC.exe" >> $env:GITHUB_ENV
       - run: cargo build --locked --release --target ${{ matrix.target }}
-      - run: python scripts/package-installer.py ${{ matrix.platform }} target/${{ matrix.target }}/release/${{ matrix.binary }} --architecture ${{ matrix.architecture }}
+      - if: matrix.platform == 'windows'
+        run: python scripts/collect-rclone-licenses.py --source rclone-source --architecture ${{ matrix.architecture }} --output "$env:RUNNER_TEMP\rclone-licenses"
+      - if: matrix.platform != 'windows'
+        run: python scripts/package-installer.py ${{ matrix.platform }} target/${{ matrix.target }}/release/${{ matrix.binary }} --architecture ${{ matrix.architecture }}
+      - if: matrix.platform == 'windows'
+        run: python scripts/package-installer.py windows target/${{ matrix.target }}/release/${{ matrix.binary }} --architecture ${{ matrix.architecture }} --rclone-licenses "$env:RUNNER_TEMP\rclone-licenses"
       - if: matrix.platform == 'windows' && matrix.architecture == 'x64'
-        run: python tests/windows-installer.py target/${{ matrix.target }}/release/${{ matrix.binary }} "$env:ISCC" --user-data
+        run: python tests/windows-installer.py target/${{ matrix.target }}/release/${{ matrix.binary }} "$env:ISCC" --rclone-licenses "$env:RUNNER_TEMP\rclone-licenses" --user-data
       - if: matrix.platform == 'macos'
         run: bash tests/package-macos-app.sh
       - uses: actions/upload-artifact@v4

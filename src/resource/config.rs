@@ -1214,6 +1214,9 @@ impl Default for Apps {
 pub struct App {
     /// Path to `rclone.exe`.
     pub path: StrictPath,
+    /// Whether the path was selected from the adjacent bundled Rclone distribution.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bundled: bool,
     /// Any global flags (space-separated) to include in Rclone commands.
     pub arguments: String,
 }
@@ -1224,12 +1227,60 @@ impl App {
     }
 
     fn default_rclone() -> Self {
+        let bundled = {
+            #[cfg(target_os = "windows")]
+            {
+                std::env::current_exe().ok().and_then(|x| bundled_rclone(&x))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                None
+            }
+        };
+        let from_path = which::which("rclone")
+            .ok()
+            .map(StrictPath::from)
+            .map(|path| path.rendered());
+
+        Self::default_rclone_from_candidates(bundled, from_path)
+    }
+
+    fn default_rclone_from_candidates(bundled: Option<StrictPath>, from_path: Option<StrictPath>) -> Self {
+        let (path, bundled) = match bundled {
+            Some(path) => (path, true),
+            None => (from_path.unwrap_or_default(), false),
+        };
+
         Self {
-            path: which::which("rclone")
-                .map(|x| StrictPath::from(x).rendered())
-                .unwrap_or_default(),
+            path,
+            bundled,
             arguments: "--fast-list --ignore-checksum".to_string(),
         }
+    }
+
+    pub fn set_explicit_path(&mut self, path: StrictPath) {
+        self.path = path;
+        self.bundled = false;
+    }
+
+    pub fn set_explicit_path_raw(&mut self, path: String) {
+        self.path.reset(path);
+        self.bundled = false;
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn bundled_rclone(executable: &std::path::Path) -> Option<StrictPath> {
+    let path = executable.parent()?.join("Rclone").join("rclone.exe");
+    path.is_file().then(|| StrictPath::from(path).rendered())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn refresh_bundled_rclone(app: &mut App, executable: &std::path::Path) {
+    if app.bundled
+        && let Some(path) = bundled_rclone(executable)
+    {
+        app.path = path;
     }
 }
 
@@ -1416,7 +1467,16 @@ impl ResourceFile for Config {
         self.custom_games.retain(|x| !x.is_empty());
 
         if self.apps.rclone.path.raw().is_empty() {
-            self.apps.rclone.path = App::default_rclone().path;
+            let default = App::default_rclone();
+            self.apps.rclone.path = default.path;
+            self.apps.rclone.bundled = default.bundled;
+        }
+
+        #[cfg(target_os = "windows")]
+        if self.apps.rclone.bundled
+            && let Ok(executable) = std::env::current_exe()
+        {
+            refresh_bundled_rclone(&mut self.apps.rclone, &executable);
         }
 
         self.backup.filter.build_globs();
@@ -2163,6 +2223,62 @@ mod tests {
     }
 
     #[test]
+    fn discovers_bundled_rclone_next_to_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("ludusavi.exe");
+        let bundled = root.path().join("Rclone").join("rclone.exe");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, b"").unwrap();
+
+        assert_eq!(bundled_rclone(&executable), Some(StrictPath::from(bundled).rendered()));
+        assert_eq!(bundled_rclone(&root.path().join("other/ludusavi.exe")), None);
+    }
+
+    #[test]
+    fn bundled_rclone_tracks_relocation_without_replacing_custom_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("moved/ludusavi.exe");
+        let bundled = executable.parent().unwrap().join("Rclone/rclone.exe");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, b"").unwrap();
+        let old = StrictPath::new("old/Rclone/rclone.exe");
+        let mut app = App {
+            path: old.clone(),
+            bundled: true,
+            arguments: "--fast-list".into(),
+        };
+        refresh_bundled_rclone(&mut app, &executable);
+        assert_eq!(app.path, StrictPath::from(bundled).rendered());
+        assert_eq!(app.arguments, "--fast-list");
+        let resolved = app.path.clone();
+        refresh_bundled_rclone(&mut app, &root.path().join("missing/ludusavi.exe"));
+        assert_eq!(app.path, resolved);
+        app.set_explicit_path(old.clone());
+        refresh_bundled_rclone(&mut app, &executable);
+        assert_eq!(app.path, old);
+        assert!(!app.bundled);
+        app.bundled = true;
+        app.set_explicit_path_raw("custom.exe".into());
+        assert!(!app.bundled);
+        assert_eq!(app.path.raw(), "custom.exe");
+    }
+
+    #[test]
+    fn rclone_provenance_defaults_only_to_actual_bundle() {
+        let path = StrictPath::new("custom/rclone.exe");
+        let from_path = App::default_rclone_from_candidates(None, Some(path.clone()));
+        assert!(!from_path.bundled);
+        assert_eq!(from_path.path, path);
+        assert!(!App::default_rclone_from_candidates(None, None).bundled);
+        let bundle = App::default_rclone_from_candidates(Some(path.clone()), None);
+        assert!(bundle.bundled);
+        assert!(serde_yaml::to_string(&bundle).unwrap().contains("bundled: true"));
+        assert!(!serde_yaml::to_string(&from_path).unwrap().contains("bundled:"));
+        let legacy: App = serde_yaml::from_str("path: old/Rclone/rclone.exe\narguments: --fast-list\n").unwrap();
+        assert!(!legacy.bundled);
+    }
+
+    #[test]
     fn can_parse_optional_fields_when_present_in_config() {
         let config = Config::load_from_string(
             r#"
@@ -2299,6 +2415,7 @@ mod tests {
                     rclone: App {
                         path: StrictPath::new("rclone.exe".to_string()),
                         arguments: "".to_string(),
+                        bundled: false,
                     },
                 },
                 custom_games: vec![
@@ -2521,6 +2638,7 @@ customGames:
                     rclone: App {
                         path: StrictPath::new("rclone.exe".to_string()),
                         arguments: "".to_string(),
+                        bundled: false,
                     }
                 },
                 custom_games: vec![

@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import tomllib
 
+from rclone_bundle import prepare_rclone_bundle
+
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -43,7 +45,15 @@ def linux_root(binary: Path, root: Path, version: str) -> None:
     control.chmod(0o644)
 
 
-def package(binary: Path, platform: str, architecture: str, output: Path, version: str, release: bool = False) -> Path:
+def package(
+    binary: Path,
+    platform: str,
+    architecture: str,
+    output: Path,
+    version: str,
+    release: bool = False,
+    rclone_licenses: Path | None = None,
+) -> Path:
     if platform == "macos" and release:
         required = ["LUDUSAVI_MACOS_SIGNING_IDENTITY", "LUDUSAVI_MACOS_INSTALLER_IDENTITY", "LUDUSAVI_MACOS_NOTARY_PROFILE"]
         missing = [name for name in required if not os.environ.get(name)]
@@ -52,14 +62,19 @@ def package(binary: Path, platform: str, architecture: str, output: Path, versio
     output.mkdir(parents=True, exist_ok=True)
     stem = f"ludusavi-{version}-{architecture}"
     if platform == "windows":
+        if rclone_licenses is None:
+            raise RuntimeError("Windows packages require --rclone-licenses from the pinned Rclone source")
         compiler = os.environ.get("ISCC") or shutil.which("ISCC")
         if not compiler:
             raise RuntimeError("Install Inno Setup 6 and set ISCC to its ISCC.exe path")
-        subprocess.run([
-            compiler, f"/DBinary={binary}", f"/DVersion={version}",
-            f"/DArchitecture={architecture}", f"/DOutput={output}",
-            str(ROOT / "installer/windows.iss"),
-        ], check=True)
+        with tempfile.TemporaryDirectory(prefix="ludusavi-rclone-") as temporary:
+            rclone_dir = Path(temporary) / "Rclone"
+            prepare_rclone_bundle(architecture, rclone_dir, rclone_licenses)
+            subprocess.run([
+                compiler, f"/DBinary={binary}", f"/DRcloneDir={rclone_dir}",
+                f"/DVersion={version}", f"/DArchitecture={architecture}",
+                f"/DOutput={output}", str(ROOT / "installer/windows.iss"),
+            ], check=True)
         result = output / f"{stem}-setup.exe"
     else:
         with tempfile.TemporaryDirectory(prefix="ludusavi-installer-") as temporary:
@@ -108,10 +123,15 @@ if __name__ == "__main__":
     parser.add_argument("--architecture", required=True, choices=["x86", "x64", "arm64"])
     parser.add_argument("--output", type=Path, default=ROOT / "dist")
     parser.add_argument("--release", action="store_true", help="Require Developer ID signing and notarization for macOS")
+    parser.add_argument("--rclone-licenses", type=Path, help="Output of collect-rclone-licenses.py for Windows packages")
     arguments = parser.parse_args()
     binary = arguments.binary.resolve(strict=True)
     expected = {"windows": {"x86", "x64"}, "linux": {"x64"}, "macos": {"arm64", "x64"}}
     if arguments.architecture not in expected[arguments.platform]:
         parser.error("Unsupported platform/architecture combination")
     version = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
-    print(package(binary, arguments.platform, arguments.architecture, arguments.output.resolve(), version, arguments.release))
+    licenses = arguments.rclone_licenses.resolve(strict=True) if arguments.rclone_licenses else None
+    print(package(
+        binary, arguments.platform, arguments.architecture, arguments.output.resolve(),
+        version, arguments.release, licenses,
+    ))

@@ -949,6 +949,7 @@ mod tests {
             App {
                 path: StrictPath::new(std::env::var("LUDUSAVI_TEST_RCLONE").unwrap()),
                 arguments: format!("--config \"{}\"", rclone_config.render()),
+                bundled: false,
             },
             Remote::Custom { id: "test".into() },
         );
@@ -1059,6 +1060,7 @@ mod tests {
             App {
                 path: StrictPath::new(std::env::var("LUDUSAVI_TEST_RCLONE").unwrap()),
                 arguments: format!("--config \"{}\" --delete-excluded", rclone_config.render()),
+                bundled: false,
             },
             Remote::Custom { id: "test".into() },
         );
@@ -1237,6 +1239,7 @@ mod tests {
             App {
                 path: StrictPath::new("rclone".to_string()),
                 arguments: "--progress".to_string(),
+                bundled: false,
             },
             Remote::Custom {
                 id: "cloud".to_string(),

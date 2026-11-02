@@ -2822,7 +2822,7 @@ impl App {
                     }
                     config::Event::RcloneExecutable(text) => {
                         self.text_histories.rclone_executable.push(&text);
-                        self.config.apps.rclone.path.reset(text);
+                        self.config.apps.rclone.set_explicit_path_raw(text);
                     }
                     config::Event::RcloneArguments(text) => {
                         self.text_histories.rclone_arguments.push(&text);
@@ -3167,7 +3167,7 @@ impl App {
                     }
                     BrowseFileSubject::RcloneExecutable => {
                         self.text_histories.rclone_executable.push(path.raw());
-                        self.config.apps.rclone.path = path;
+                        self.config.apps.rclone.set_explicit_path(path);
                     }
                     BrowseFileSubject::RootLutrisDatabase(i) => {
                         self.text_histories.roots[i].lutris_database.push(path.raw());
@@ -3433,10 +3433,13 @@ impl App {
                         &mut self.config.backup.filter.ignored_registry[i],
                         &mut self.text_histories.backup_filter_ignored_registry[i],
                     ),
-                    UndoSubject::RcloneExecutable => shortcut.apply_to_strict_path_field(
-                        &mut self.config.apps.rclone.path,
-                        &mut self.text_histories.rclone_executable,
-                    ),
+                    UndoSubject::RcloneExecutable => {
+                        shortcut.apply_to_strict_path_field(
+                            &mut self.config.apps.rclone.path,
+                            &mut self.text_histories.rclone_executable,
+                        );
+                        self.config.apps.rclone.bundled = false;
+                    }
                     UndoSubject::RcloneArguments => shortcut.apply_to_string_field(
                         &mut self.config.apps.rclone.arguments,
                         &mut self.text_histories.rclone_arguments,
@@ -3974,6 +3977,28 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_rclone_edits_and_history_clear_bundled_provenance() {
+        let mut app = App::default();
+        app.config.apps.rclone.bundled = true;
+        let _ = app.update(config::Event::RcloneExecutable("custom.exe".into()).into());
+        assert!(!app.config.apps.rclone.bundled);
+        app.config.apps.rclone.bundled = true;
+        let _ = app.update(Message::SelectedFile(
+            BrowseFileSubject::RcloneExecutable,
+            StrictPath::new("selected.exe"),
+        ));
+        assert!(!app.config.apps.rclone.bundled);
+        for action in [
+            super::super::undoable::Action::Undo,
+            super::super::undoable::Action::Redo,
+        ] {
+            app.config.apps.rclone.bundled = true;
+            let _ = app.update(Message::UndoRedo(action, UndoSubject::RcloneExecutable));
+            assert!(!app.config.apps.rclone.bundled);
+        }
+    }
     use crate::{
         gui::game_list::GameListEntry,
         scan::{Duplication, ScanChange, ScanInfo, ScannedFile, layout::GameLayout},
