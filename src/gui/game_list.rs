@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use iced::{
     Alignment, Length, alignment::Horizontal as HorizontalAlignment, keyboard::Modifiers, padding, widget::tooltip,
@@ -23,7 +23,7 @@ use crate::{
         },
     },
     lang::TRANSLATOR,
-    prelude::StrictPath,
+    prelude::{AnyError, StrictPath},
     resource::{
         cache::Cache,
         config::{self, Config, Sort},
@@ -35,12 +35,20 @@ use crate::{
 };
 
 #[derive(Default)]
+pub(crate) struct BackupMetadataEdit {
+    when: chrono::DateTime<chrono::Utc>,
+    comment: Option<String>,
+    locked: Option<bool>,
+}
+
+#[derive(Default)]
 pub struct GameListEntry {
     pub scan_info: ScanInfo,
     pub backup_info: Option<BackupInfo>,
     pub tree: Option<FileTree>,
     pub comment_editor: Option<iced::widget::text_editor::Content<iced::Renderer>>,
     pub game_layout: Option<GameLayout>,
+    pub(crate) metadata_edits: HashMap<String, BackupMetadataEdit>,
     /// The `scan_info` gets mutated in response to things like toggling saves off,
     /// so we need a persistent flag to say if the game has been scanned yet.
     pub scanned: bool,
@@ -869,6 +877,9 @@ impl GameList {
             return false;
         }
         layout.set_backup_comment(&backup.id(), &comment);
+        let edit = entry.metadata_edits.entry(backup.name().to_owned()).or_default();
+        edit.when = *backup.when();
+        edit.comment = Some(comment.clone());
         backup.set_comment(comment);
 
         true
@@ -889,6 +900,9 @@ impl GameList {
             return None;
         }
         layout.set_backup_comment(&backup.id(), &comment);
+        let edit = entry.metadata_edits.entry(backup.name().to_owned()).or_default();
+        edit.when = *backup.when();
+        edit.comment = Some(comment.clone());
         backup.set_comment(comment.clone());
 
         Some(comment)
@@ -909,17 +923,54 @@ impl GameList {
         let new = !backup.locked();
 
         layout.set_backup_locked(&backup.id(), new);
+        let edit = entry.metadata_edits.entry(backup.name().to_owned()).or_default();
+        edit.when = *backup.when();
+        edit.locked = Some(new);
         backup.set_locked(new);
 
         true
     }
 
-    pub fn save_layout(&mut self, game: &str) {
-        let Some(index) = self.find_game(game) else { return };
+    pub fn save_layout(&mut self, game: &str) -> Result<(), AnyError> {
+        let Some(index) = self.find_game(game) else {
+            return Ok(());
+        };
         let entry = &mut self.entries[index];
-        let Some(layout) = &mut entry.game_layout else { return };
+        let Some(layout) = &entry.game_layout else {
+            return Ok(());
+        };
+        if entry.metadata_edits.is_empty() {
+            return Ok(());
+        }
+        let mut current = GameLayout::load(layout.path.clone())?;
+        let backups = current.restorable_backups_flattened();
+        for (name, edit) in &entry.metadata_edits {
+            let backup = backups
+                .iter()
+                .find(|backup| backup.name() == name && *backup.when() == edit.when)
+                .ok_or("The selected backup changed. Discard the unsaved changes before refreshing.")?;
+            if let Some(comment) = &edit.comment {
+                current.set_backup_comment(&backup.id(), comment);
+            }
+            if let Some(locked) = edit.locked {
+                current.set_backup_locked(&backup.id(), locked);
+            }
+        }
+        use std::io::Write;
+        let target = layout.path.joined("mapping.yaml").as_std_path_buf()?;
+        let mut temporary = tempfile::NamedTempFile::new_in(target.parent().ok_or("Invalid mapping path")?)?;
+        temporary.write_all(current.mapping_content().as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(target).map_err(|error| error.error)?;
+        entry.game_layout = Some(current);
+        entry.metadata_edits.clear();
+        Ok(())
+    }
 
-        layout.save();
+    pub fn discard_metadata_edits(&mut self, game: &str) {
+        if let Some(index) = self.find_game(game) {
+            self.entries[index].metadata_edits.clear();
+        }
     }
 
     pub fn mapping(&self, game: &str) -> Option<(StrictPath, String)> {

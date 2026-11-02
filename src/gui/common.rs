@@ -128,6 +128,7 @@ pub enum Message {
     },
     Save,
     SyncEditedMetadata,
+    DiscardBackupMetadata(String),
     EditedMetadataSynced(Vec<(String, Result<(), Error>)>),
     CloseModal,
     UpdateTime,
