@@ -615,6 +615,17 @@ pub struct MetadataEdit {
     pub after: String,
 }
 
+fn escape_filter_pattern(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for character in path.chars() {
+        if matches!(character, '\\' | '*' | '?' | '[' | ']' | '{' | '}') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
 impl Rclone {
     pub fn new(app: App, remote: Remote) -> Self {
         Self { app, remote }
@@ -818,20 +829,29 @@ impl Rclone {
                     Some(snapshot)
                 };
                 let mut process = if finality.preview() {
-                    self.sync(root, remote_path, SyncDirection::Upload, finality, games)
+                    let games: Vec<_> = games.iter().map(|game| escape_filter_pattern(game)).collect();
+                    self.sync(root, remote_path, SyncDirection::Upload, finality, &games)
                 } else {
-                    let snapshot_root = StrictPath::from(snapshot.as_ref().unwrap().path());
-                    let mut args = self.sync_args(&snapshot_root, remote_path, SyncDirection::Upload, finality, games);
-                    for arg in &mut args {
-                        for game in games {
-                            if *arg == format!("--include=/{game}/**") {
-                                *arg = format!("--include=/{game}/mapping.yaml");
-                            }
-                        }
-                    }
-                    // Force same-size note changes on remotes with coarse timestamps or no hashes.
-                    args.push("--ignore-times".into());
-                    self.launch_sync(&snapshot_root, SyncDirection::Upload, args)
+                    let file = edit.file.as_std_path_buf().map_err(|_| Error::CloudConflict)?;
+                    let root_path = root.as_std_path_buf().map_err(|_| Error::CloudConflict)?;
+                    let relative = file.strip_prefix(root_path).map_err(|_| Error::CloudConflict)?;
+                    let source = StrictPath::from(snapshot.as_ref().unwrap().path().join(relative));
+                    RcloneProcess::launch(
+                        self.app.path.raw().into(),
+                        self.args(&[
+                            "copyto".into(),
+                            source.render(),
+                            self.path(&format!(
+                                "{}/{}",
+                                remote_path.trim_end_matches('/'),
+                                relative.to_string_lossy()
+                            )),
+                            "-v".into(),
+                            "--use-json-log".into(),
+                            "--progress=false".into(),
+                            "--ignore-times".into(),
+                        ]),
+                    )
                 }
                 .map_err(Error::UnableToSynchronizeCloud)?;
                 let output = process.wait(cancel).map_err(Error::UnableToSynchronizeCloud)?;
@@ -989,6 +1009,93 @@ mod tests {
             "a newer cloud save"
         );
         assert_ne!(remote_root.joined("game/mapping.yaml").try_read().unwrap(), edit.after);
+
+        for (selected, other) in [("Game [1]", "Game 1"), ("Game {1,2}", "Game 2")] {
+            for base in [&root, &remote_root] {
+                let mapping = base.joined(&format!("{selected}/mapping.yaml"));
+                mapping.create_parent_dir().unwrap();
+                mapping.write_with_content("original note\n").unwrap();
+                let mapping = base.joined(&format!("{other}/mapping.yaml"));
+                mapping.create_parent_dir().unwrap();
+                mapping.write_with_content("unrelated note\n").unwrap();
+            }
+            let file = root.joined(&format!("{selected}/mapping.yaml"));
+            file.write_with_content("modified note\n").unwrap();
+            let edit = MetadataEdit {
+                file,
+                before: "original note\n".into(),
+                after: "modified note\n".into(),
+            };
+            rclone
+                .upload_metadata(&root, &remote_path, &edit, &AtomicBool::new(false))
+                .unwrap();
+            assert_eq!(
+                remote_root
+                    .joined(&format!("{selected}/mapping.yaml"))
+                    .try_read()
+                    .unwrap(),
+                edit.after
+            );
+            assert_eq!(
+                remote_root.joined(&format!("{other}/mapping.yaml")).try_read().unwrap(),
+                "unrelated note\n"
+            );
+        }
+
+        let root = base.joined("delete-excluded/local");
+        let remote = base.joined("delete-excluded/remote");
+        for directory in [&root, &remote] {
+            let file = directory.joined("game/mapping.yaml");
+            file.create_parent_dir().unwrap();
+            file.write_with_content("original note\n").unwrap();
+            directory
+                .joined("game/save.dat")
+                .write_with_content("saved game")
+                .unwrap();
+        }
+        let file = root.joined("game/mapping.yaml");
+        file.write_with_content("modified note\n").unwrap();
+        let rclone = Rclone::new(
+            App {
+                path: StrictPath::new(std::env::var("LUDUSAVI_TEST_RCLONE").unwrap()),
+                arguments: format!("--config \"{}\" --delete-excluded", rclone_config.render()),
+            },
+            Remote::Custom { id: "test".into() },
+        );
+        rclone
+            .upload_metadata(
+                &root,
+                &remote.render(),
+                &MetadataEdit {
+                    file,
+                    before: "original note\n".into(),
+                    after: "modified note\n".into(),
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(
+            remote.joined("game/mapping.yaml").try_read().unwrap(),
+            "modified note\n"
+        );
+        assert_eq!(remote.joined("game/save.dat").try_read().unwrap(), "saved game");
+    }
+
+    #[test]
+    fn metadata_filters_treat_game_folder_names_literally() {
+        assert_eq!(
+            escape_filter_pattern(r"Game [1] {a,b} * ? \\"),
+            r"Game \[1\] \{a,b\} \* \? \\\\"
+        );
+        let rclone = Rclone::new(App::default(), Remote::Custom { id: "test".into() });
+        let args = rclone.sync_args(
+            &StrictPath::new("backups"),
+            "backups",
+            SyncDirection::Upload,
+            Finality::Final,
+            &[escape_filter_pattern("Game [1]")],
+        );
+        assert!(args.contains(&r"--include=/Game \[1\]/**".to_owned()));
     }
 
     fn metadata_fixture() -> (tempfile::TempDir, StrictPath, MetadataEdit, Rclone) {
