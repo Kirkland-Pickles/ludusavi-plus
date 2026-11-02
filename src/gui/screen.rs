@@ -37,7 +37,12 @@ fn template(content: Column) -> Element {
         .into()
 }
 
-fn make_status_row<'a>(status: &OperationStatus, duplication: Duplication) -> Row<'a> {
+fn make_status_row<'a>(
+    status: &OperationStatus,
+    duplication: Duplication,
+    scan_kind: ScanKind,
+    filtering_duplicates: bool,
+) -> Row<'a> {
     let size = 25;
 
     Row::new()
@@ -53,8 +58,12 @@ fn make_status_row<'a>(status: &OperationStatus, duplication: Duplication) -> Ro
         })
         .push(text("|").size(size))
         .push(text(TRANSLATOR.processed_bytes(status)).size(size))
-        .push_if(!duplication.resolved(), || {
-            Badge::new(&TRANSLATOR.badge_duplicates()).view()
+        .push_if(filtering_duplicates || !duplication.resolved(), || {
+            let mut badge = Badge::new(&TRANSLATOR.badge_duplicates());
+            if filtering_duplicates {
+                badge = badge.on_press(Message::FilterDuplicates { scan_kind, game: None });
+            }
+            badge.view()
         })
 }
 
@@ -116,6 +125,8 @@ impl Backup {
                     duplicatees.as_ref(),
                 ),
                 self.duplicate_detector.overall(),
+                Self::SCAN_KIND,
+                self.log.filter_duplicates_of.is_some(),
             ))
             .push(
                 Row::new()
@@ -207,6 +218,8 @@ impl Restore {
                     duplicatees.as_ref(),
                 ),
                 self.duplicate_detector.overall(),
+                Self::SCAN_KIND,
+                self.log.filter_duplicates_of.is_some(),
             ))
             .push(
                 Row::new()
