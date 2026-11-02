@@ -443,7 +443,7 @@ impl App {
         if let Ok(enabled) = autostart::is_enabled() {
             self.background_settings.start_on_boot = enabled;
         }
-        let (id, open) = iced::window::open(super::window_settings());
+        let (id, open) = iced::window::open(super::window_settings(true));
         self.background_settings_window = Some(id);
         open.map(|_| Message::Ignore)
     }
@@ -1841,7 +1841,8 @@ impl App {
         background_config: Result<background::Config, String>,
         instance: Option<background::Instance>,
     ) -> (Self, Task<Message>) {
-        let (window, open) = iced::window::open(super::window_settings());
+        let hidden = flags.background;
+        let (window, open) = iced::window::open(super::window_settings(!flags.background));
         let mut errors = vec![];
         let mut commands = vec![
             open.map(|_| Message::Ignore),
@@ -1980,6 +1981,7 @@ impl App {
                 background_instance: instance,
                 background_settings,
                 window: Some(window),
+                hidden,
                 ..Self::default()
             },
             Task::batch(commands),
@@ -2026,22 +2028,35 @@ impl App {
                     return apply_title_bar;
                 }
                 self.window = Some(id);
+                let mut background_error = None;
                 if let Some(config) = self.background_config.take() {
                     match background::Background::new(config, self.background_instance.take()) {
                         Ok(background) => {
                             self.background = Some(background);
-                            // Leave startup questions and errors visible.
-                            if self.flags.background && self.modals.is_empty() {
-                                self.hidden = true;
-                                return Task::batch([apply_title_bar, self.hide_window(id)]);
-                            }
                         }
                         Err(why) => {
-                            return Task::batch([apply_title_bar, self.show_error(Error::ConfigInvalid { why })]);
+                            background_error = Some(Error::ConfigInvalid { why });
                         }
                     }
                 }
-                apply_title_bar
+                let show_window = if self.flags.background {
+                    if self.modals.is_empty() && self.background.as_ref().is_some_and(background::Background::has_tray)
+                    {
+                        self.hidden = true;
+                        Task::none()
+                    } else {
+                        self.show_window()
+                    }
+                } else {
+                    Task::none()
+                };
+                Task::batch([
+                    apply_title_bar,
+                    show_window,
+                    background_error
+                        .map(|error| self.show_error(error))
+                        .unwrap_or_else(Task::none),
+                ])
             }
             #[cfg(windows)]
             Message::SystemTheme(mode) => {
@@ -3889,6 +3904,33 @@ mod tests {
         gui::game_list::GameListEntry,
         scan::{ScanInfo, layout::GameLayout},
     };
+
+    #[test]
+    fn background_startup_windows_begin_hidden_and_reveal_startup_prompts() {
+        assert!(!crate::gui::window_settings(false).visible);
+        assert!(crate::gui::window_settings(true).visible);
+
+        for modal in [
+            Modal::Errors {
+                errors: vec![Error::CloudConflict],
+            },
+            Modal::ConfirmAddMissingRoots(vec![]),
+        ] {
+            let mut app = App {
+                flags: Flags {
+                    background: true,
+                    ..Default::default()
+                },
+                hidden: true,
+                modals: vec![modal],
+                ..Default::default()
+            };
+            let window = iced::window::Id::unique();
+            let _ = app.update(Message::WindowOpened(window));
+            assert_eq!(app.window, Some(window));
+            assert!(!app.hidden);
+        }
+    }
 
     #[test]
     fn automatic_backup_finishes_once_and_manual_backups_do_not_notify() {

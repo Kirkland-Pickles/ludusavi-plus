@@ -90,10 +90,11 @@ pub fn run(flags: Flags) {
     }
 }
 
-fn window_settings() -> iced::window::Settings {
+fn window_settings(visible: bool) -> iced::window::Settings {
     iced::window::Settings {
         min_size: Some(Size::new(800.0, 600.0)),
         exit_on_close_request: false,
+        visible,
         #[cfg(target_os = "linux")]
         platform_specific: iced::window::settings::PlatformSpecific {
             application_id: std::env::var(crate::prelude::ENV_LINUX_APP_ID)
