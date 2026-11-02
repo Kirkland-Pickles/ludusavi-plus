@@ -252,12 +252,12 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: ludusavi-v*
+          pattern: ludusavi-v*-win*
           merge-multiple: true
           path: release-assets
       - uses: actions/download-artifact@v4
         with:
-          pattern: ludusavi-installer-*
+          pattern: ludusavi-installer-windows-*
           merge-multiple: true
           path: release-assets
       - uses: softprops/action-gh-release@v2
