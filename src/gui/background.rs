@@ -964,6 +964,12 @@ impl Instance {
     }
 }
 
+impl Drop for Instance {
+    fn drop(&mut self) {
+        let _ = self._lock.unlock();
+    }
+}
+
 pub struct Background {
     pub config: Config,
     pub monitor: Monitor,
@@ -1284,6 +1290,21 @@ mod tests {
         assert!(second.actions().is_empty());
         drop(first);
         assert!(Instance::acquire(&first_path, None).unwrap().is_some());
+    }
+
+    #[test]
+    fn dropping_instance_releases_lock_with_inherited_file_handle() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("background.lock");
+        let instance = Instance::acquire(&path, None).unwrap().unwrap();
+        let inherited = instance._lock.try_clone().unwrap();
+
+        drop(instance);
+
+        let replacement = Instance::acquire(&path, None).unwrap();
+        assert!(replacement.is_some());
+        drop(replacement);
+        drop(inherited);
     }
 
     #[test]

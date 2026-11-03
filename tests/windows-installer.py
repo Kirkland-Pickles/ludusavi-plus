@@ -73,25 +73,36 @@ def run(binary, compiler, rclone_licenses, user_data=False):
             assert ctypes.windll.shell32.SHGetFolderPathW(None, 26, None, 0, appdata) == 0
             configuration = Path(appdata.value) / "ludusavi"
             assert not configuration.exists(), "The test account already has Ludusavi data"
-        configuration.mkdir()
-        isolated = [str(binary), "--config", str(root / "defaults"), "--no-manifest-update"]
-        config = json.loads(subprocess.check_output(isolated + ["config", "show", "--api"], text=True))
-        config["backup"]["path"] = str(root / "backups")
-        config["restore"]["path"] = str(root / "restore")
-        config["release"]["check"] = False
-        config["theme"] = "dark"
-        config["customGames"] = [{"name": "Installer Test", "files": [str(root / "save.txt")]}]
-        config["roots"] = [{"store": "other", "path": str(root / "games")}]
-        config["apps"]["rclone"]["path"] = str(root / "custom-rclone.exe")
-        config["apps"]["rclone"]["arguments"] = "--fast-list"
-        sentinel = configuration / "config.yaml"
-        sentinel.write_text(json.dumps(config), encoding="utf-8")
-        expected = sentinel.read_bytes()
-        config = json.loads(subprocess.check_output([
-            str(binary), "--config", str(configuration), "--no-manifest-update", "config", "show", "--api",
-        ], text=True))
-        assert sentinel.read_bytes() == expected, "Reading configuration changed its contents"
+        created_configuration = False
         try:
+            configuration.mkdir()
+            created_configuration = True
+            isolated = [str(binary), "--config", str(root / "defaults"), "--no-manifest-update"]
+            config = json.loads(subprocess.check_output(isolated + ["config", "show", "--api"], text=True))
+            config["backup"]["path"] = str(root / "backups")
+            config["restore"]["path"] = str(root / "restore")
+            config["release"]["check"] = False
+            config["theme"] = "dark"
+            config["customGames"] = [{"name": "Installer Test", "files": [str(root / "save.txt")]}]
+            config["roots"] = [{"store": "other", "path": str(root / "games")}]
+            config["apps"]["rclone"]["path"] = str(root / "custom-rclone.exe")
+            config["apps"]["rclone"]["arguments"] = "--fast-list"
+            configured = config
+            sentinel = configuration / "config.yaml"
+            sentinel.write_text(json.dumps(config), encoding="utf-8")
+            config = json.loads(subprocess.check_output([
+                str(binary), "--config", str(configuration), "--no-manifest-update", "config", "show", "--api",
+            ], text=True))
+            assert config["backup"]["path"] == configured["backup"]["path"]
+            assert config["restore"]["path"] == configured["restore"]["path"]
+            assert config["release"]["check"] is False
+            assert config["theme"] == "dark"
+            assert config["customGames"][0]["name"] == "Installer Test"
+            assert config["customGames"][0]["files"] == configured["customGames"][0]["files"]
+            assert config["roots"] == configured["roots"]
+            assert config["apps"]["rclone"]["path"] == configured["apps"]["rclone"]["path"]
+            assert config["apps"]["rclone"]["arguments"] == "--fast-list"
+            expected = sentinel.read_bytes()
             for version in ["0.31.0", "0.31.1"]:
                 subprocess.run([
                     str(root / f"ludusavi-{version}-x64-setup.exe"), "/CURRENTUSER", "/VERYSILENT",
@@ -106,7 +117,7 @@ def run(binary, compiler, rclone_licenses, user_data=False):
                     command += ["--config", str(configuration)]
                 current = json.loads(subprocess.check_output(command + ["config", "show", "--api"], text=True))
                 assert current == config, "Installed app used the wrong configuration or changed saved settings"
-                expected = sentinel.read_bytes()
+                assert sentinel.read_bytes() == expected, "Reading migrated configuration changed its contents"
                 fresh = json.loads(subprocess.check_output([
                     str(install / "ludusavi.exe"), "--config", str(root / "fresh-config"),
                     "--no-manifest-update", "config", "show", "--api",
@@ -135,7 +146,7 @@ def run(binary, compiler, rclone_licenses, user_data=False):
                 if not (install / "unins000.exe").exists():
                     break
                 time.sleep(0.2)
-            if user_data:
+            if user_data and created_configuration and configuration.exists():
                 shutil.rmtree(configuration)
 
 
