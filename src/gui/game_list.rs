@@ -23,7 +23,7 @@ use crate::{
         },
     },
     lang::TRANSLATOR,
-    prelude::{AnyError, StrictPath},
+    prelude::AnyError,
     resource::{
         cache::Cache,
         config::{self, Config, Sort},
@@ -971,12 +971,6 @@ impl GameList {
         if let Some(index) = self.find_game(game) {
             self.entries[index].metadata_edits.clear();
         }
-    }
-
-    pub fn mapping(&self, game: &str) -> Option<(StrictPath, String)> {
-        let entry = &self.entries[self.find_game(game)?];
-        let layout = entry.game_layout.as_ref()?;
-        Some((layout.path.joined("mapping.yaml"), layout.mapping_content()))
     }
 
     fn manifests(&self, manifest: &Manifest) -> Vec<game_filter::Manifest> {

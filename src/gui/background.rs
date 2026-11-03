@@ -556,7 +556,6 @@ pub struct BackupRun {
     pub game: String,
     started: Instant,
     pub result: BackupResult,
-    pub cloud_error: Option<crate::prelude::Error>,
 }
 
 #[derive(Clone, Debug)]
@@ -572,7 +571,6 @@ impl BackupRun {
             game,
             started: Instant::now(),
             result: BackupResult::Skipped,
-            cloud_error: None,
         }
     }
 
@@ -604,10 +602,7 @@ impl BackupRun {
 
     pub fn finished(self, errors: &[crate::prelude::Error], cancelled: bool) -> BackupNotice {
         use crate::{lang::TRANSLATOR, prelude::Error};
-        let error = self
-            .cloud_error
-            .as_ref()
-            .or_else(|| errors.iter().find(|error| **error != Error::SomeEntriesFailed));
+        let error = errors.iter().find(|error| **error != Error::SomeEntriesFailed);
         let (title, message, failed) = if cancelled {
             (
                 "Automatic backup cancelled",
@@ -618,9 +613,6 @@ impl BackupRun {
             ("Automatic backup failed", reason, true)
         } else if let Some(error) = error {
             let title = match (&self.result, error) {
-                (BackupResult::Saved | BackupResult::Unchanged, _) if self.cloud_error.is_some() => {
-                    "Backup saved; cloud sync failed"
-                }
                 (
                     BackupResult::Saved | BackupResult::Unchanged,
                     Error::CloudConflict | Error::UnableToSynchronizeCloud(_),
@@ -1356,16 +1348,6 @@ mod tests {
         let mut run = BackupRun::new("Example".into());
         run.result = BackupResult::Saved;
         assert_eq!(run.finished(&[], true).title, "Automatic backup cancelled");
-    }
-
-    #[test]
-    fn note_sync_failure_is_reported_after_a_successful_local_backup() {
-        let mut run = BackupRun::new("Example".into());
-        run.result = BackupResult::Saved;
-        run.cloud_error = Some(crate::prelude::Error::SomeEntriesFailed);
-        let notice = run.finished(&[], false);
-        assert_eq!(notice.title, "Backup saved; cloud sync failed");
-        assert!(notice.failed);
     }
 
     #[test]

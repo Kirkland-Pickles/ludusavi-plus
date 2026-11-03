@@ -1,7 +1,4 @@
-use std::{
-    io::{BufRead, BufReader, Read},
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::io::{BufRead, BufReader};
 
 use crate::{
     lang::TRANSLATOR,
@@ -85,13 +82,6 @@ impl RcloneProcess {
     }
 
     pub fn events(&mut self) -> Vec<RcloneProcessEvent> {
-        match self.stderr.as_mut() {
-            Some(stderr) => Self::parse_events(stderr.lines().take(10).filter_map(Result::ok)),
-            None => vec![],
-        }
-    }
-
-    fn parse_events(lines: impl Iterator<Item = String>) -> Vec<RcloneProcessEvent> {
         let mut events = vec![];
 
         #[derive(Debug, serde::Deserialize)]
@@ -109,113 +99,60 @@ impl RcloneProcess {
             total_bytes: f32,
         }
 
-        for line in lines {
-            match serde_json::from_str::<Log>(&line) {
-                Ok(Log::Skip { skipped, object }) => match skipped.as_str() {
-                    "copy" => events.push(RcloneProcessEvent::Change(CloudChange {
-                        path: object,
-                        change: ScanChange::Different,
-                    })),
-                    "delete" => events.push(RcloneProcessEvent::Change(CloudChange {
-                        path: object,
-                        change: ScanChange::Removed,
-                    })),
-                    raw => {
-                        log::trace!("Unhandled Rclone 'skipped': {raw}");
+        if let Some(stderr) = self.stderr.as_mut() {
+            for line in stderr.lines().take(10).filter_map(|x| x.ok()) {
+                match serde_json::from_str::<Log>(&line) {
+                    Ok(Log::Skip { skipped, object }) => match skipped.as_str() {
+                        "copy" => events.push(RcloneProcessEvent::Change(CloudChange {
+                            path: object,
+                            change: ScanChange::Different,
+                        })),
+                        "delete" => events.push(RcloneProcessEvent::Change(CloudChange {
+                            path: object,
+                            change: ScanChange::Removed,
+                        })),
+                        raw => {
+                            log::trace!("Unhandled Rclone 'skipped': {raw}");
+                        }
+                    },
+                    Ok(Log::Change { msg, object }) => match msg.as_str() {
+                        "Copied (new)" => events.push(RcloneProcessEvent::Change(CloudChange {
+                            path: object,
+                            change: ScanChange::New,
+                        })),
+                        "Copied (replaced existing)" => events.push(RcloneProcessEvent::Change(CloudChange {
+                            path: object,
+                            change: ScanChange::Different,
+                        })),
+                        "Deleted" => events.push(RcloneProcessEvent::Change(CloudChange {
+                            path: object,
+                            change: ScanChange::Removed,
+                        })),
+                        raw => {
+                            log::trace!("Unhandled Rclone 'msg': {raw}");
+                        }
+                    },
+                    Ok(Log::Stats {
+                        stats: Stats { bytes, total_bytes },
+                    }) => {
+                        if total_bytes > 0.0 {
+                            events.push(RcloneProcessEvent::Progress {
+                                current: bytes,
+                                max: total_bytes,
+                            });
+                        }
                     }
-                },
-                Ok(Log::Change { msg, object }) => match msg.as_str() {
-                    "Copied (new)" => events.push(RcloneProcessEvent::Change(CloudChange {
-                        path: object,
-                        change: ScanChange::New,
-                    })),
-                    "Copied (replaced existing)" => events.push(RcloneProcessEvent::Change(CloudChange {
-                        path: object,
-                        change: ScanChange::Different,
-                    })),
-                    "Deleted" => events.push(RcloneProcessEvent::Change(CloudChange {
-                        path: object,
-                        change: ScanChange::Removed,
-                    })),
-                    raw => {
-                        log::trace!("Unhandled Rclone 'msg': {raw}");
+                    Err(_) => {
+                        log::trace!("Unhandled Rclone message: {line}");
                     }
-                },
-                Ok(Log::Stats {
-                    stats: Stats { bytes, total_bytes },
-                }) => {
-                    if total_bytes > 0.0 {
-                        events.push(RcloneProcessEvent::Progress {
-                            current: bytes,
-                            max: total_bytes,
-                        });
-                    }
-                }
-                Err(_) => {
-                    log::trace!("Unhandled Rclone message: {line}");
                 }
             }
         }
+
         if !events.is_empty() {
             log::trace!("New Rclone events: {events:?}");
         }
         events
-    }
-
-    fn wait(&mut self, cancel: &AtomicBool) -> Result<CommandOutput, CommandError> {
-        let stdout = self.child.stdout.take().unwrap();
-        let stderr = self.stderr.take().unwrap();
-        let terminated = || CommandError::Terminated {
-            program: self.program.clone(),
-            args: self.args.clone(),
-        };
-        let (status, stdout, stderr) = std::thread::scope(|scope| {
-            fn read(mut reader: impl Read) -> std::io::Result<String> {
-                let mut bytes = Vec::new();
-                reader
-                    .read_to_end(&mut bytes)
-                    .map(|_| String::from_utf8_lossy(&bytes).into_owned())
-            }
-            let stdout = scope.spawn(move || read(stdout));
-            let stderr = scope.spawn(move || read(stderr));
-            let status = loop {
-                if cancel.load(Ordering::Relaxed) {
-                    let _ = self.child.kill();
-                    break self.child.wait();
-                }
-                match self.child.try_wait() {
-                    Ok(Some(status)) => break Ok(status),
-                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
-                    Err(error) => {
-                        let _ = self.child.kill();
-                        let _ = self.child.wait();
-                        break Err(error);
-                    }
-                }
-            };
-            (status, stdout.join(), stderr.join())
-        });
-        let status = status.map_err(|_| terminated())?;
-        let stdout = stdout.map_err(|_| terminated())?.map_err(|_| terminated())?;
-        let stderr = stderr.map_err(|_| terminated())?.map_err(|_| terminated())?;
-        if cancel.load(Ordering::Relaxed) {
-            return Err(terminated());
-        }
-        match status.code() {
-            Some(0) => Ok(CommandOutput {
-                code: 0,
-                stdout,
-                stderr,
-            }),
-            Some(code) => Err(CommandError::Exited {
-                program: self.program.clone(),
-                args: self.args.clone(),
-                code,
-                stdout: (!stdout.is_empty()).then_some(stdout),
-                stderr: (!stderr.is_empty()).then_some(stderr),
-            }),
-            None => Err(terminated()),
-        }
     }
 
     pub fn succeeded(&mut self) -> Option<Result<(), CommandError>> {
@@ -608,24 +545,6 @@ pub struct Rclone {
     remote: Remote,
 }
 
-#[derive(Clone, Debug)]
-pub struct MetadataEdit {
-    pub file: StrictPath,
-    pub before: String,
-    pub after: String,
-}
-
-fn escape_filter_pattern(path: &str) -> String {
-    let mut escaped = String::with_capacity(path.len());
-    for character in path.chars() {
-        if matches!(character, '\\' | '*' | '?' | '[' | ']' | '{' | '}') {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped
-}
-
 impl Rclone {
     pub fn new(app: App, remote: Remote) -> Self {
         Self { app, remote }
@@ -764,474 +683,19 @@ impl Rclone {
         finality: Finality,
         game_dirs: &[String],
     ) -> Result<RcloneProcess, CommandError> {
-        self.launch_sync(
-            local,
-            direction,
-            self.sync_args(local, remote_path, direction, finality, game_dirs),
-        )
-    }
-
-    fn launch_sync(
-        &self,
-        local: &StrictPath,
-        direction: SyncDirection,
-        args: Vec<String>,
-    ) -> Result<RcloneProcess, CommandError> {
         if direction == SyncDirection::Upload && !local.exists() {
             // Rclone will fail with exit code 3 if the local folder does not exist.
             _ = local.create_dirs();
         }
 
+        let args = self.sync_args(local, remote_path, direction, finality, game_dirs);
         RcloneProcess::launch(self.app.path.raw().into(), self.args(&args))
-    }
-
-    pub fn upload_metadata(
-        &self,
-        root: &StrictPath,
-        remote_path: &str,
-        edit: &MetadataEdit,
-        cancel: &AtomicBool,
-    ) -> Result<(), Error> {
-        self.upload_metadata_with(
-            root,
-            remote_path,
-            edit,
-            |args| {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(Error::SomeEntriesFailed);
-                }
-                RcloneProcess::launch(self.app.path.raw().into(), self.args(args))
-                    .and_then(|mut process| process.wait(cancel))
-                    .map_err(Error::UnableToSynchronizeCloud)
-            },
-            |finality, games| {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(Error::SomeEntriesFailed);
-                }
-                let snapshot = if finality.preview() {
-                    None
-                } else {
-                    let snapshot = tempfile::tempdir().map_err(|_| Error::SomeEntriesFailed)?;
-                    let relative = edit.file.as_std_path_buf().map_err(|_| Error::CloudConflict)?;
-                    let root_path = root.as_std_path_buf().map_err(|_| Error::CloudConflict)?;
-                    let relative = relative.strip_prefix(root_path).map_err(|_| Error::CloudConflict)?;
-                    let file = snapshot.path().join(relative);
-                    std::fs::create_dir_all(file.parent().unwrap()).map_err(|_| Error::SomeEntriesFailed)?;
-                    std::fs::write(file, &edit.after).map_err(|_| Error::SomeEntriesFailed)?;
-                    let modified = std::fs::metadata(edit.file.as_std_path_buf().map_err(|_| Error::CloudConflict)?)
-                        .and_then(|metadata| metadata.modified())
-                        .map_err(|_| Error::SomeEntriesFailed)?;
-                    std::fs::File::options()
-                        .write(true)
-                        .open(snapshot.path().join(relative))
-                        .and_then(|file| file.set_times(std::fs::FileTimes::new().set_modified(modified)))
-                        .map_err(|_| Error::SomeEntriesFailed)?;
-                    Some(snapshot)
-                };
-                let mut process = if finality.preview() {
-                    let games: Vec<_> = games.iter().map(|game| escape_filter_pattern(game)).collect();
-                    self.sync(root, remote_path, SyncDirection::Upload, finality, &games)
-                } else {
-                    let file = edit.file.as_std_path_buf().map_err(|_| Error::CloudConflict)?;
-                    let root_path = root.as_std_path_buf().map_err(|_| Error::CloudConflict)?;
-                    let relative = file.strip_prefix(root_path).map_err(|_| Error::CloudConflict)?;
-                    let source = StrictPath::from(snapshot.as_ref().unwrap().path().join(relative));
-                    RcloneProcess::launch(
-                        self.app.path.raw().into(),
-                        self.args(&[
-                            "copyto".into(),
-                            source.render(),
-                            self.path(&format!(
-                                "{}/{}",
-                                remote_path.trim_end_matches('/'),
-                                relative.to_string_lossy()
-                            )),
-                            "-v".into(),
-                            "--use-json-log".into(),
-                            "--progress=false".into(),
-                            "--ignore-times".into(),
-                        ]),
-                    )
-                }
-                .map_err(Error::UnableToSynchronizeCloud)?;
-                let output = process.wait(cancel).map_err(Error::UnableToSynchronizeCloud)?;
-                Ok(RcloneProcess::parse_events(output.stderr.lines().map(str::to_owned))
-                    .into_iter()
-                    .filter_map(|event| match event {
-                        RcloneProcessEvent::Change(change) => Some(change),
-                        _ => None,
-                    })
-                    .collect())
-            },
-        )
-    }
-
-    fn upload_metadata_with(
-        &self,
-        root: &StrictPath,
-        remote_path: &str,
-        edit: &MetadataEdit,
-        read: impl FnOnce(&[String]) -> Result<CommandOutput, Error>,
-        mut sync: impl FnMut(Finality, &[String]) -> Result<Vec<CloudChange>, Error>,
-    ) -> Result<(), Error> {
-        if edit.before == edit.after {
-            return Ok(());
-        }
-        let root = root.as_std_path_buf().map_err(|_| Error::CloudConflict)?;
-        let file = edit.file.as_std_path_buf().map_err(|_| Error::CloudConflict)?;
-        let relative = file.strip_prefix(root).map_err(|_| Error::CloudConflict)?;
-        // A game mapping is the only file an annotation can change.
-        if relative.components().count() != 2 || relative.file_name().and_then(|x| x.to_str()) != Some("mapping.yaml") {
-            return Err(Error::CloudConflict);
-        }
-        if edit.file.try_read().ok().as_deref() != Some(edit.after.as_str()) {
-            return Err(Error::SomeEntriesFailed);
-        }
-        let destination = self.path(&format!(
-            "{}/{}",
-            remote_path.trim_end_matches('/'),
-            relative.to_string_lossy()
-        ));
-        let remote = read(&["cat".into(), destination])?.stdout;
-        if remote.trim() == edit.after.trim() {
-            return Ok(());
-        }
-        if remote.trim() != edit.before.trim() {
-            return Err(Error::CloudConflict);
-        }
-        let relative = relative.to_string_lossy().replace('\\', "/");
-        let game = relative.split('/').next().ok_or(Error::CloudConflict)?.to_string();
-        let games = [game];
-        let changes = sync(Finality::Preview, &games)?;
-        if changes
-            .iter()
-            .any(|change| change.path.replace('\\', "/") != relative || change.change == ScanChange::Removed)
-        {
-            return Err(Error::CloudConflict);
-        }
-        sync(Finality::Final, &games)?;
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    #[ignore = "Requires LUDUSAVI_TEST_GAME pointing to the process helper"]
-    fn cancelling_metadata_wait_terminates_and_reaps_the_process() {
-        let helper = std::env::var("LUDUSAVI_TEST_GAME").unwrap();
-        let mut process = RcloneProcess::launch(helper, vec![]).unwrap();
-        let cancel = AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                cancel.store(true, Ordering::Relaxed);
-            });
-            let start = std::time::Instant::now();
-            assert!(matches!(process.wait(&cancel), Err(CommandError::Terminated { .. })));
-            assert!(start.elapsed() < std::time::Duration::from_secs(5));
-            assert!(process.child.try_wait().unwrap().is_some());
-        });
-    }
-
-    #[test]
-    #[ignore = "Requires LUDUSAVI_TEST_RCLONE pointing to a real Rclone executable"]
-    fn note_sync_with_local_test_remote() {
-        let temp = tempfile::tempdir().unwrap();
-        let base = StrictPath::new(temp.path().to_string_lossy().into_owned());
-        let root = base.joined("backups");
-        let remote_root = base.joined("remote");
-        let rclone_config = base.joined("rclone.conf");
-        rclone_config.write_with_content("[test]\ntype = local\n").unwrap();
-        let rclone = Rclone::new(
-            App {
-                path: StrictPath::new(std::env::var("LUDUSAVI_TEST_RCLONE").unwrap()),
-                arguments: format!("--config \"{}\"", rclone_config.render()),
-                bundled: false,
-            },
-            Remote::Custom { id: "test".into() },
-        );
-        let file = root.joined("game/mapping.yaml");
-        file.create_parent_dir().unwrap();
-        file.write_with_content("original note\n").unwrap();
-        root.joined("game/save.txt").write_with_content("saved game").unwrap();
-        let remote_path = remote_root.render();
-        rclone
-            .run(
-                &rclone.sync_args(&root, &remote_path, SyncDirection::Upload, Finality::Final, &[]),
-                &[0],
-                Privacy::Public,
-            )
-            .unwrap();
-        file.write_with_content("modified note\n").unwrap();
-        let edit = MetadataEdit {
-            file: file.clone(),
-            before: "original note\n".into(),
-            after: file.try_read().unwrap(),
-        };
-        rclone
-            .upload_metadata(&root, &remote_path, &edit, &AtomicBool::new(false))
-            .unwrap();
-        assert_eq!(remote_root.joined("game/mapping.yaml").try_read().unwrap(), edit.after);
-        assert_eq!(remote_root.joined("game/save.txt").try_read().unwrap(), "saved game");
-        let preview = rclone
-            .run(
-                &rclone.sync_args(&root, &remote_path, SyncDirection::Upload, Finality::Preview, &[]),
-                &[0],
-                Privacy::Public,
-            )
-            .unwrap();
-        assert!(
-            RcloneProcess::parse_events(preview.stderr.lines().map(str::to_owned))
-                .iter()
-                .all(|event| !matches!(event, RcloneProcessEvent::Change(_))),
-            "{}",
-            preview.stderr
-        );
-        // A change from another machine must still block the ordinary backup upload.
-        remote_root
-            .joined("game/save.txt")
-            .write_with_content("a newer cloud save")
-            .unwrap();
-        file.write_with_content("another note\n").unwrap();
-        let edit = MetadataEdit {
-            file: file.clone(),
-            before: edit.after,
-            after: file.try_read().unwrap(),
-        };
-        assert!(matches!(
-            rclone.upload_metadata(&root, &remote_path, &edit, &AtomicBool::new(false)),
-            Err(Error::CloudConflict)
-        ));
-        assert_eq!(
-            remote_root.joined("game/save.txt").try_read().unwrap(),
-            "a newer cloud save"
-        );
-        assert_ne!(remote_root.joined("game/mapping.yaml").try_read().unwrap(), edit.after);
-
-        for (selected, other) in [("Game [1]", "Game 1"), ("Game {1,2}", "Game 2")] {
-            for base in [&root, &remote_root] {
-                let mapping = base.joined(&format!("{selected}/mapping.yaml"));
-                mapping.create_parent_dir().unwrap();
-                mapping.write_with_content("original note\n").unwrap();
-                let mapping = base.joined(&format!("{other}/mapping.yaml"));
-                mapping.create_parent_dir().unwrap();
-                mapping.write_with_content("unrelated note\n").unwrap();
-            }
-            let file = root.joined(&format!("{selected}/mapping.yaml"));
-            file.write_with_content("modified note\n").unwrap();
-            let edit = MetadataEdit {
-                file,
-                before: "original note\n".into(),
-                after: "modified note\n".into(),
-            };
-            rclone
-                .upload_metadata(&root, &remote_path, &edit, &AtomicBool::new(false))
-                .unwrap();
-            assert_eq!(
-                remote_root
-                    .joined(&format!("{selected}/mapping.yaml"))
-                    .try_read()
-                    .unwrap(),
-                edit.after
-            );
-            assert_eq!(
-                remote_root.joined(&format!("{other}/mapping.yaml")).try_read().unwrap(),
-                "unrelated note\n"
-            );
-        }
-
-        let root = base.joined("delete-excluded/local");
-        let remote = base.joined("delete-excluded/remote");
-        for directory in [&root, &remote] {
-            let file = directory.joined("game/mapping.yaml");
-            file.create_parent_dir().unwrap();
-            file.write_with_content("original note\n").unwrap();
-            directory
-                .joined("game/save.dat")
-                .write_with_content("saved game")
-                .unwrap();
-        }
-        let file = root.joined("game/mapping.yaml");
-        file.write_with_content("modified note\n").unwrap();
-        let rclone = Rclone::new(
-            App {
-                path: StrictPath::new(std::env::var("LUDUSAVI_TEST_RCLONE").unwrap()),
-                arguments: format!("--config \"{}\" --delete-excluded", rclone_config.render()),
-                bundled: false,
-            },
-            Remote::Custom { id: "test".into() },
-        );
-        rclone
-            .upload_metadata(
-                &root,
-                &remote.render(),
-                &MetadataEdit {
-                    file,
-                    before: "original note\n".into(),
-                    after: "modified note\n".into(),
-                },
-                &AtomicBool::new(false),
-            )
-            .unwrap();
-        assert_eq!(
-            remote.joined("game/mapping.yaml").try_read().unwrap(),
-            "modified note\n"
-        );
-        assert_eq!(remote.joined("game/save.dat").try_read().unwrap(), "saved game");
-    }
-
-    #[test]
-    fn metadata_filters_treat_game_folder_names_literally() {
-        assert_eq!(
-            escape_filter_pattern(r"Game [1] {a,b} * ? \\"),
-            r"Game \[1\] \{a,b\} \* \? \\\\"
-        );
-        let rclone = Rclone::new(App::default(), Remote::Custom { id: "test".into() });
-        let args = rclone.sync_args(
-            &StrictPath::new("backups"),
-            "backups",
-            SyncDirection::Upload,
-            Finality::Final,
-            &[escape_filter_pattern("Game [1]")],
-        );
-        assert!(args.contains(&r"--include=/Game \[1\]/**".to_owned()));
-    }
-
-    fn metadata_fixture() -> (tempfile::TempDir, StrictPath, MetadataEdit, Rclone) {
-        let temp = tempfile::tempdir().unwrap();
-        let root = StrictPath::new(temp.path().to_string_lossy().into_owned());
-        let file = root.joined("game/mapping.yaml");
-        file.create_parent_dir().unwrap();
-        file.write_with_content("new note\n").unwrap();
-        let edit = MetadataEdit {
-            file,
-            before: "old note\n".into(),
-            after: "new note\n".into(),
-        };
-        let rclone = Rclone::new(App::default(), Remote::Custom { id: "cloud".into() });
-        (temp, root, edit, rclone)
-    }
-
-    #[test]
-    fn annotation_upload_uses_existing_sync_after_safe_preview() {
-        let (_temp, root, edit, rclone) = metadata_fixture();
-        let mut calls = Vec::new();
-        rclone
-            .upload_metadata_with(
-                &root,
-                "backups",
-                &edit,
-                |_| {
-                    Ok(CommandOutput {
-                        code: 0,
-                        stdout: edit.before.clone(),
-                        stderr: String::new(),
-                    })
-                },
-                |finality, games| {
-                    calls.push((finality, games.to_vec()));
-                    Ok(vec![CloudChange {
-                        path: "game/mapping.yaml".into(),
-                        change: ScanChange::Different,
-                    }])
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            calls,
-            vec![
-                (Finality::Preview, vec!["game".into()]),
-                (Finality::Final, vec!["game".into()])
-            ]
-        );
-        rclone
-            .upload_metadata_with(
-                &root,
-                "backups",
-                &edit,
-                |_| {
-                    Ok(CommandOutput {
-                        code: 0,
-                        stdout: edit.after.clone(),
-                        stderr: String::new(),
-                    })
-                },
-                |_, _| panic!("Already synchronized"),
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn annotation_upload_preserves_independent_cloud_changes() {
-        let (_temp, root, edit, rclone) = metadata_fixture();
-        let result = rclone.upload_metadata_with(
-            &root,
-            "backups",
-            &edit,
-            |_| {
-                Ok(CommandOutput {
-                    code: 0,
-                    stdout: "another machine's backup".into(),
-                    stderr: String::new(),
-                })
-            },
-            |_, _| panic!("Must not sync a conflict"),
-        );
-        assert!(matches!(result, Err(Error::CloudConflict)));
-        let mut calls = 0;
-        let result = rclone.upload_metadata_with(
-            &root,
-            "backups",
-            &edit,
-            |_| {
-                Ok(CommandOutput {
-                    code: 0,
-                    stdout: edit.before.clone(),
-                    stderr: String::new(),
-                })
-            },
-            |finality, _| {
-                calls += 1;
-                assert_eq!(finality, Finality::Preview);
-                Ok(vec![CloudChange {
-                    path: "game/save.zip".into(),
-                    change: ScanChange::Different,
-                }])
-            },
-        );
-        assert!(matches!(result, Err(Error::CloudConflict)));
-        assert_eq!(calls, 1);
-    }
-
-    #[test]
-    fn annotation_upload_rejects_unsaved_edits_and_paths_outside_root() {
-        let (_temp, root, mut edit, rclone) = metadata_fixture();
-        edit.after = "not saved".into();
-        assert!(matches!(
-            rclone.upload_metadata_with(&root, "backups", &edit, |_| panic!(), |_, _| panic!()),
-            Err(Error::SomeEntriesFailed)
-        ));
-        assert!(matches!(
-            rclone.upload_metadata_with(&root.joined("other"), "backups", &edit, |_| panic!(), |_, _| panic!()),
-            Err(Error::CloudConflict)
-        ));
-    }
-
-    #[test]
-    fn annotation_upload_does_not_sync_after_failed_cloud_read() {
-        let (_temp, root, edit, rclone) = metadata_fixture();
-        let result = rclone.upload_metadata_with(
-            &root,
-            "backups",
-            &edit,
-            |_| Err(Error::SomeEntriesFailed),
-            |_, _| panic!("Must not sync after a failed read"),
-        );
-        assert!(result.is_err());
-    }
 
     #[test]
     fn sync_disables_terminal_progress_after_custom_arguments() {
